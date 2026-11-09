@@ -10,6 +10,7 @@ import { CONNECT_PATH } from './connect-protocol.ts'
 import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
 import { assertTrustedAuthority } from './api-request-trust.ts'
 import { BrowserAuth } from './browser-auth.ts'
+import { parsePublicOrigin } from './public-origin.ts'
 import { HostConnectionService } from './rpc-host.ts'
 import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
 
@@ -52,6 +53,7 @@ export {
 export { HostConnectionService } from './rpc-host.ts'
 
 export { API_PATH } from './api-path.ts'
+export { parsePublicOrigin, publicUrlMatchesOrigin, selectConfiguredPublicOrigin } from './public-origin.ts'
 
 /** Stable Cordis plugin name. */
 export const name = 'client-connection'
@@ -84,6 +86,13 @@ export interface ConnectionConfig {
    * an entry here. A non-canonical or non-bare authority fails plugin load.
    */
   trustedHosts?: string[]
+  /**
+   * One exact public `http(s)://host[:port]` origin served by a loopback
+   * reverse proxy. When `X-Forwarded-Proto` and `X-Forwarded-Host` from that
+   * peer equal this origin, API and WebSocket checks and the auth cookie use
+   * it. Any other forwarded value is ignored. A wildcard is rejected.
+   */
+  publicOrigin?: string
   /** Absolute browser and API cookie lifetime in days. Default: 30. */
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
@@ -93,6 +102,7 @@ export interface ConnectionConfig {
 export const Config: z<ConnectionConfig> = z.object({
   recovery: ConnectionRecoveryConfigSchema.default({}),
   trustedHosts: z.array(String).default([]),
+  publicOrigin: z.string(),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
 })
@@ -113,11 +123,14 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
-  const connection = new HostConnectionService(
-    ctx,
-    trustedHosts,
-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
-  )
+  const rawOrigin = config?.publicOrigin
+  const publicOrigin = typeof rawOrigin === 'string' && rawOrigin !== ''
+    ? parsePublicOrigin(rawOrigin, 'publicOrigin')
+    : undefined
+  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays)
+  const connection = publicOrigin === undefined
+    ? new HostConnectionService(ctx, trustedHosts, browserAuth)
+    : new HostConnectionService(ctx, trustedHosts, browserAuth, publicOrigin)
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.on('webserver/index-inject', (table) => {
       table.push({ kind: 'global', name: '__DSH_CONNECTION_RECOVERY__', value: recovery })
