@@ -645,7 +645,7 @@ index 0000000..0ee33ba
 +Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
 diff --git a/artifacts/voxcpm-resume-deploy.md b/artifacts/voxcpm-resume-deploy.md
 new file mode 100644
-index 0000000..d664908
+index 0000000..1b8a933
 --- /dev/null
 +++ b/artifacts/voxcpm-resume-deploy.md
 @@ -0,0 +1,85 @@
@@ -655,9 +655,9 @@ index 0000000..d664908
 +
 +## What the code does today
 +
-+`speech.synthesize/v1` runs `tts_process.py` once. `VoxCPM.from_pretrained(..., device=...)` is one call, then `generate` runs once per cue. This repository does not reload the model per cue. It also never reads the parameter device after load, and the UI stays on `Generating translated speech with VoxCPM2` until the process exits.
++Pinned `voxcpm==2.0.3` documents `VoxCPM.from_pretrained(..., device="cuda:0")`. That value is passed into `VoxCPM2Model.from_local`, which loads weights on CPU and finishes with `module.to(device)`. Explicit `cuda` or `cuda:0` raises if CUDA is unavailable; only `device=None` or `"auto"` may fall back. The wrapper class has no `to`. This patch passes `device` into `from_pretrained` and then calls `tts_model.to(device)` before checking parameters and buffers. If they are still not on that device, no cue is generated. The model is loaded once. `generate` keeps the existing `source_clone` arguments.
 +
-+Cancel leaves synthesize incomplete. `POST /api/youdub/v2` `retry` keeps completed steps, increments the attempt, and runs synthesize in a new directory `tasks/<id>/attempts/<attempt>/<invocationId>/`. It does not delete older attempt directories (`delete` is the call that removes the task tree). It also does not read the 54 wavs. `request.json` is written for every cue before generation, so that file does not prove a wav was produced from that cue. There is no per-cue receipt. A wav without a receipt must not be reused.
++Cancel leaves synthesize incomplete. Retry keeps completed steps and uses a new attempt directory. It does not delete older attempts. `request.json` is written once for the whole list and can be overwritten by a later run, so it is not proof that `000054.wav` came from clip 54. A wav without a receipt is not reused.
 +
 +## Before any retry
 +
@@ -680,7 +680,7 @@ index 0000000..d664908
 +
 +## Adopt only the checksummed clips
 +
-+Receipts are written only after every listed wav, its reference wav, and `tts/request.json` match the checksum file. Wav bytes are not modified. A mismatch writes nothing.
++`00000N.wav` is accepted only as clip N in the checksummed `tts/request.json`: the Nth `clips` entry must name that same filename, and that entry's reference wav must be in the same checksum file. If the live `request.json` hash differs from the backup, adopt writes nothing. The receipt stores that ordinal, segment id, exact text, reference checksum, wav checksum, and the request checksum. Resume copies the wav only when the new cue has the same ordinal, segment id, text, and reference checksum. A checksum match with a different cue is not reused. Wav bytes are not modified.
 +
 +```sh
 +MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
@@ -715,7 +715,7 @@ index 0000000..d664908
 +pgrep -af tts_process.py
 +```
 +
-+The task log should show `Loading VoxCPM2 once on cuda:0` and then `VoxCPM2 loaded once; requested cuda:0; tensors on cuda:0`. If parameters are not on `cuda:0`, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt proves checksum identity, not that the original 54 clips ran on CUDA.
++The task log should show `Loading VoxCPM2 once on cuda:0` and then `tensors on cuda:0`. That line is written only after `tts_model.to("cuda:0")`. If the tensors are still elsewhere, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt records the checksummed ordinal and text; it does not prove those 54 clips ran on CUDA. No GPU run was measured here.
 +
 +## Apply
 +
@@ -813,7 +813,7 @@ index 94ac9f1..dd632d8 100644
          try:
              error = json.loads(result.stderr.strip().splitlines()[-1])
 diff --git a/backend/app/v1/tts_process.py b/backend/app/v1/tts_process.py
-index 267a102..88d1dce 100644
+index 267a102..0cbba2d 100644
 --- a/backend/app/v1/tts_process.py
 +++ b/backend/app/v1/tts_process.py
 @@ -1,11 +1,19 @@
@@ -837,7 +837,7 @@ index 267a102..88d1dce 100644
  import traceback
  from pathlib import Path
  
-@@ -15,11 +23,218 @@ def _fail(code: str, message: str) -> int:
+@@ -15,11 +23,254 @@ def _fail(code: str, message: str) -> int:
      return 1
  
  
@@ -929,9 +929,13 @@ index 267a102..88d1dce 100644
 +    return payload if isinstance(payload, dict) else None
 +
 +
-+def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path) -> bool:
++def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path, ordinal: int) -> bool:
 +    reference = Path(clip["reference_path"]).resolve()
 +    if receipt.get("version") != 1 or receipt.get("segment_id") != clip["segment_id"]:
++        return False
++    if receipt.get("ordinal") != ordinal:
++        return False
++    if wav.stem.isdigit() and int(wav.stem) != ordinal:
 +        return False
 +    if receipt.get("text") != clip["text"] or receipt.get("reference_text") != clip["reference_text"]:
 +        return False
@@ -950,10 +954,14 @@ index 267a102..88d1dce 100644
 +    return legacy or receipt.get("device") == device
 +
 +
-+def _write_receipt(wav: Path, clip: dict, model_path: Path, device: str | None, *, legacy: bool) -> None:
++def _write_receipt(
++    wav: Path, clip: dict, model_path: Path, device: str | None, *,
++    legacy: bool, ordinal: int, request_sha256: str | None = None,
++) -> None:
 +    reference = Path(clip["reference_path"]).resolve()
 +    payload = {
 +        "version": 1,
++        "ordinal": ordinal,
 +        "segment_id": clip["segment_id"],
 +        "text": clip["text"],
 +        "reference_text": clip["reference_text"],
@@ -962,6 +970,7 @@ index 267a102..88d1dce 100644
 +        "model_path": str(model_path),
 +        "device": device,
 +        "legacy": legacy,
++        "request_sha256": request_sha256,
 +    }
 +    path = _receipt_path(wav)
 +    temporary = path.with_suffix(".json.partial")
@@ -994,32 +1003,40 @@ index 267a102..88d1dce 100644
 +    return found
 +
 +
-+def _reuse_in_place(clip: dict, model_path: Path, device: str) -> bool:
++def _reuse_in_place(clip: dict, ordinal: int, model_path: Path, device: str) -> bool:
 +    wav = Path(clip["output_path"])
 +    receipt = _load_receipt(wav)
 +    if receipt is None:
 +        return False
-+    return _receipt_allows(receipt, device) and _content_matches(receipt, clip, model_path, wav)
++    return _receipt_allows(receipt, device) and _content_matches(receipt, clip, model_path, wav, ordinal)
 +
 +
-+def _adopt_prior(clip: dict, model_path: Path, device: str, task_root: Path | None) -> bool:
-+    """Copy one already-receipted wav. The source file is left where it is."""
++def _adopt_prior(clip: dict, ordinal: int, model_path: Path, device: str, task_root: Path | None) -> bool:
++    """Copy one already-receipted wav of the same ordinal. The source file stays put."""
 +    if task_root is None:
 +        return False
 +    destination = Path(clip["output_path"])
-+    if _reuse_in_place(clip, model_path, device):
++    if _reuse_in_place(clip, ordinal, model_path, device):
 +        return True
++    if not destination.stem.isdigit() or int(destination.stem) != ordinal:
++        return False
 +    for source in _prior_wavs(task_root, destination):
++        if source.name != destination.name:
++            continue
 +        receipt = _load_receipt(source)
 +        if receipt is None or not _receipt_allows(receipt, device):
 +            continue
-+        if not _content_matches(receipt, clip, model_path, source):
++        if not _content_matches(receipt, clip, model_path, source, ordinal):
 +            continue
 +        if destination.exists():
 +            _preserve(destination)
 +        _copy_wav(source, destination)
-+        _write_receipt(destination, clip, model_path, receipt.get("device"), legacy=receipt.get("legacy") is True)
-+        return _reuse_in_place(clip, model_path, device)
++        _write_receipt(
++            destination, clip, model_path, receipt.get("device"),
++            legacy=receipt.get("legacy") is True, ordinal=ordinal,
++            request_sha256=receipt.get("request_sha256"),
++        )
++        return _reuse_in_place(clip, ordinal, model_path, device)
 +    return False
 +
 +
@@ -1036,6 +1053,25 @@ index 267a102..88d1dce 100644
 +        if text not in found:
 +            found.append(text)
 +    return found
++
++
++def _place_tts(model, requested: str) -> list[str]:
++    """Move the loaded VoxCPM2 module onto the requested device.
++
++    voxcpm 2.0.3's public ``from_pretrained(..., device=)`` forwards that
++    string to ``VoxCPM2Model.from_local``, which ends in ``module.to(device)``.
++    The wrapper class itself has no ``to``. Call the module method again so a
++    load that stayed on CPU is actually placed before any cue is generated.
++    """
++    tts = getattr(model, "tts_model", None)
++    move = getattr(tts, "to", None)
++    if requested.startswith("cuda") or requested == "mps":
++        if not callable(move):
++            raise RuntimeError(f"VoxCPM2 tts_model has no to(); cannot place it on {requested}.")
++        move(requested)
++    elif callable(move):
++        move(requested)
++    return _tensor_devices(model)
 +
 +
 +def _require_cuda(requested: str, devices: list[str]) -> str | None:
@@ -1056,7 +1092,7 @@ index 267a102..88d1dce 100644
      options = parser.parse_args(argv)
      model_path = options.model_path.resolve()
      if not model_path.is_dir():
-@@ -45,12 +260,36 @@ def main(argv: list[str] | None = None) -> int:
+@@ -45,12 +296,38 @@ def main(argv: list[str] | None = None) -> int:
                  raise ValueError("Reference audio transcript is missing")
      except (OSError, ValueError, KeyError, TypeError):
          return _fail("INPUT_MISSING", "The speech generation request or reference audio is invalid.")
@@ -1067,7 +1103,9 @@ index 267a102..88d1dce 100644
 +    total = len(clips)
 +    pending = []
 +    for index, clip in enumerate(clips, start=1):
-+        if _reuse_in_place(clip, model_path, options.device) or _adopt_prior(clip, model_path, options.device, task_root):
++        if _reuse_in_place(clip, index, model_path, options.device) or _adopt_prior(
++            clip, index, model_path, options.device, task_root,
++        ):
 +            _publish(progress_path, {
 +                "event": "cue", "index": index, "total": total, "reused": True, "seconds": 0,
 +                "message": f"VoxCPM2 reused verified cue {index}/{total}",
@@ -1094,11 +1132,11 @@ index 267a102..88d1dce 100644
      try:
          import numpy as np
          import soundfile as sf
-@@ -64,11 +303,24 @@ def main(argv: list[str] | None = None) -> int:
+@@ -64,11 +341,24 @@ def main(argv: list[str] | None = None) -> int:
          sample_rate = model.tts_model.sample_rate
          if type(sample_rate) is not int or sample_rate <= 0:
              raise ValueError("Invalid model output sample rate")
-+        devices = _tensor_devices(model)
++        devices = _place_tts(model, options.device)
 +        refused = _require_cuda(options.device, devices)
 +        if refused:
 +            return _fail("MODEL_NOT_READY", refused)
@@ -1114,13 +1152,13 @@ index 267a102..88d1dce 100644
      try:
 -        for clip in clips:
 +        for index, clip in pending:
-+            if Path(clip["output_path"]).exists() and not _reuse_in_place(clip, model_path, options.device):
++            if Path(clip["output_path"]).exists() and not _reuse_in_place(clip, index, model_path, options.device):
 +                _preserve(Path(clip["output_path"]))
 +            started = time.perf_counter()
              waveform = np.asarray(model.generate(
                  text=clip["text"], reference_wav_path=clip["reference_path"],
                  prompt_wav_path=clip["reference_path"], prompt_text=clip["reference_text"],
-@@ -77,7 +329,17 @@ def main(argv: list[str] | None = None) -> int:
+@@ -77,7 +367,20 @@ def main(argv: list[str] | None = None) -> int:
              if (waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all()
                      or np.max(np.abs(waveform)) > 1):
                  raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
@@ -1130,7 +1168,10 @@ index 267a102..88d1dce 100644
 +            partial = destination.with_suffix(".partial.wav")
 +            sf.write(partial, waveform, sample_rate, format="WAV", subtype="PCM_16")
 +            os.replace(partial, destination)
-+            _write_receipt(destination, clip, model_path, options.device, legacy=False)
++            _write_receipt(
++                destination, clip, model_path, options.device, legacy=False, ordinal=index,
++                request_sha256=_sha256(options.request_path.resolve()),
++            )
 +            elapsed = round(time.perf_counter() - started, 3)
 +            _publish(progress_path, {
 +                "event": "cue", "index": index, "total": total, "reused": False, "seconds": elapsed,
@@ -1141,10 +1182,10 @@ index 267a102..88d1dce 100644
          return _fail("INVALID_PROVIDER_RESULT", f"VoxCPM2 speech generation failed ({type(exc).__name__}).")
 diff --git a/backend/app/v1/tts_resume.py b/backend/app/v1/tts_resume.py
 new file mode 100644
-index 0000000..76c6cbc
+index 0000000..5093a15
 --- /dev/null
 +++ b/backend/app/v1/tts_resume.py
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,127 @@
 +"""Write speech-clip receipts only after a checksum backup matches the files.
 +
 +This does not generate audio and does not change wav bytes. A wav without a
@@ -1197,7 +1238,7 @@ index 0000000..76c6cbc
 +    return clips
 +
 +
-+def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str]) -> list[tuple[Path, dict]]:
++def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str]) -> list[tuple[Path, dict, int, str]]:
 +    """Return receipt writes, or raise before any file is changed."""
 +    requests = [path for path in checksums if path.name == "request.json" and path.parent.name == "tts"]
 +    if len(requests) != 1:
@@ -1206,23 +1247,26 @@ index 0000000..76c6cbc
 +    if _sha256(request_path) != checksums[request_path]:
 +        raise ValueError("request.json does not match the checksum backup.")
 +    clips = _load_request(request_path)
-+    by_output = {}
-+    for clip in clips:
-+        if not isinstance(clip, dict):
-+            raise ValueError("request.json has an invalid clip.")
-+        output = Path(str(clip.get("output_path", ""))).resolve()
-+        by_output[output] = clip
++    request_sha = checksums[request_path]
 +    planned = []
 +    for wav, digest in checksums.items():
 +        if wav.suffix != ".wav" or wav.parent.name != "tts":
 +            continue
++        if not wav.stem.isdigit() or len(wav.stem) != 6:
++            raise ValueError(f"{wav.name} is not a six-digit cue ordinal.")
++        ordinal = int(wav.stem)
++        if ordinal < 1 or ordinal > len(clips) or not isinstance(clips[ordinal - 1], dict):
++            raise ValueError(f"{wav.name} has no clip {ordinal} in the checksummed request.")
++        clip = clips[ordinal - 1]
++        if Path(str(clip.get("output_path", ""))).name != wav.name:
++            raise ValueError(
++                f"Checksummed request clip {ordinal} names "
++                f"{Path(str(clip.get('output_path', ''))).name or 'no file'}, not {wav.name}."
++            )
 +        if _sha256(wav) != digest:
 +            raise ValueError(f"{wav.name} does not match the checksum backup.")
 +        if not complete_wav(wav):
 +            raise ValueError(f"{wav.name} is not a complete mono WAV.")
-+        clip = by_output.get(wav)
-+        if clip is None:
-+            raise ValueError(f"{wav.name} is not an output of the checksummed request.")
 +        reference = Path(str(clip.get("reference_path", ""))).resolve()
 +        if not _inside(reference, task_root) or reference not in checksums:
 +            raise ValueError(f"Reference audio for {wav.name} is not in the checksum backup.")
@@ -1230,7 +1274,7 @@ index 0000000..76c6cbc
 +            raise ValueError(f"Reference audio for {wav.name} does not match the checksum backup.")
 +        if clip.get("text") is None or clip.get("reference_text") is None or clip.get("segment_id") is None:
 +            raise ValueError(f"request.json identity for {wav.name} is incomplete.")
-+        planned.append((wav, clip))
++        planned.append((wav, clip, ordinal, request_sha))
 +    if not planned:
 +        raise ValueError("The checksum file lists no tts wav clips.")
 +    return planned
@@ -1247,9 +1291,11 @@ index 0000000..76c6cbc
 +    except (OSError, ValueError, KeyError, TypeError) as exc:
 +        return _fail(str(exc))
 +    # Every check above succeeded. Receipts are the only files written.
-+    for wav, clip in planned:
++    for wav, clip, ordinal, request_sha in planned:
 +        before = wav.read_bytes()
-+        _write_receipt(wav, clip, model_path, None, legacy=True)
++        _write_receipt(
++            wav, clip, model_path, None, legacy=True, ordinal=ordinal, request_sha256=request_sha,
++        )
 +        if wav.read_bytes() != before:
 +            return _fail(f"Refusing to continue because {wav.name} changed while writing its receipt.")
 +    print(json.dumps({"receipts": len(planned), "wav_bytes_changed": False}))
@@ -1268,10 +1314,10 @@ index 0000000..76c6cbc
 +if __name__ == "__main__":
 +    raise SystemExit(main())
 diff --git a/backend/tests/test_v1_tts.py b/backend/tests/test_v1_tts.py
-index a49c7cf..f7c362f 100644
+index a49c7cf..bcbdd11 100644
 --- a/backend/tests/test_v1_tts.py
 +++ b/backend/tests/test_v1_tts.py
-@@ -417,3 +417,149 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
+@@ -417,3 +417,196 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
      assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "INVALID_PROVIDER_RESULT"
      assert len(calls) == 1
      assert not any(Path(clip["output_path"]).exists() for clip in clips)
@@ -1282,17 +1328,32 @@ index a49c7cf..f7c362f 100644
 +        self.device = device
 +
 +
-+def _install_vox(monkeypatch, device_name, generated, loaded):
++class _TTS:
++    def __init__(self, device_name):
++        self.sample_rate = 48000
++        self.params = [_Parameter(device_name)]
++        self.placed = []
++
++    def parameters(self):
++        return self.params
++
++    def to(self, device):
++        self.placed.append(device)
++        for parameter in self.params:
++            parameter.device = device
++        return self
++
++
++def _install_vox(monkeypatch, device_name, generated, loaded, start_on="same"):
 +    def generate(**kwargs):
 +        generated.append(kwargs)
 +        return np.full(4800, 0.25)
 +
 +    def load(*args, **kwargs):
-+        loaded.append((args, kwargs))
-+        return SimpleNamespace(
-+            tts_model=SimpleNamespace(sample_rate=48000, parameters=lambda: [_Parameter(device_name)]),
-+            generate=generate,
-+        )
++        initial = device_name if start_on == "same" else start_on
++        tts_model = _TTS(initial)
++        loaded.append({"args": args, "kwargs": kwargs, "tts": tts_model})
++        return SimpleNamespace(tts_model=tts_model, generate=generate)
 +
 +    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
 +
@@ -1301,13 +1362,45 @@ index a49c7cf..f7c362f 100644
 +    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
 +    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
 +    generated, loaded = [], []
-+    _install_vox(monkeypatch, "cpu", generated, loaded)
++
++    class Stuck(_TTS):
++        def to(self, device):
++            self.placed.append(device)
++            return self
++
++    def generate(**kwargs):
++        generated.append(kwargs)
++        return np.full(4800, 0.25)
++
++    def load(*args, **kwargs):
++        loaded.append(kwargs)
++        tts_model = Stuck("cpu")
++        loaded.append(tts_model)
++        return SimpleNamespace(tts_model=tts_model, generate=generate)
++
++    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
 +    clips, arguments = child_request(context)
 +    arguments[arguments.index("--device") + 1] = "cuda:0"
 +    assert tts_process.main(arguments) == 1
 +    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
-+    assert len(loaded) == 1 and not generated
++    assert loaded[0]["device"] == "cuda:0" and loaded[1].placed == ["cuda:0"]
++    assert not generated
 +    assert not any(Path(clip["output_path"]).exists() for clip in clips)
++
++
++def test_cuda_placement_moves_cpu_parameters_before_generate(context, monkeypatch):
++    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
++    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
++    generated, loaded = [], []
++    _install_vox(monkeypatch, "cuda:0", generated, loaded, start_on="cpu")
++    clips, arguments = child_request(context)
++    arguments[arguments.index("--device") + 1] = "cuda:0"
++    assert tts_process.main(arguments) == 0
++    assert loaded[0]["kwargs"]["device"] == "cuda:0"
++    assert loaded[0]["tts"].placed == ["cuda:0"]
++    assert loaded[0]["tts"].params[0].device == "cuda:0"
++    assert len(generated) == len(clips)
++    assert generated[0]["normalize"] is False and generated[0]["retry_badcase"] is False
 +
 +
 +def test_cuda_request_records_tensor_device_and_loads_once(context, monkeypatch, capsys):
