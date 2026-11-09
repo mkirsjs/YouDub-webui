@@ -716,10 +716,10 @@ index 0000000..11f3425
 +Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
 diff --git a/artifacts/voxcpm-resume-deploy.md b/artifacts/voxcpm-resume-deploy.md
 new file mode 100644
-index 0000000..bc6e271
+index 0000000..7811eea
 --- /dev/null
 +++ b/artifacts/voxcpm-resume-deploy.md
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,106 @@
 +# CUDA inference, CPU video encode, stable launch token
 +
 +Deployed HTTPS base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Keep that exact public origin. This workspace has no GPU. Python tests mock Demucs and VoxCPM. They do not measure CUDA, NVENC, or the saved backup.
@@ -757,7 +757,7 @@ index 0000000..bc6e271
 +
 +The host still prints one URL at startup so the existing access-link sync can read it. That print is the product URL, not a new log line, and this patch does not write the token anywhere else. After the rebuilt host restarts twice, both printed URLs must carry the same token and the same origin. Confirm with `stat -c %a` that the file is `600`. Do not copy the token into chat.
 +
-+This token change is host TypeScript. Apply the patch and run `npm run build:framework` before restarting `youdub-host`. The Python worker picks up Demucs, VoxCPM, and libx264 from the checkout on its next process. No model download.
++The token change is host TypeScript and was already built in `dedd29df`. The compatibility review below is bundled into `apps/harness/dist/host.mjs`. After this patch, run `npm --prefix apps/harness run build`, then restart `youdub-host`. `npm run build:framework` is not required again unless `vendor/deepseek-harness` changed. No model download.
 +
 +## Before retry
 +
@@ -773,28 +773,26 @@ index 0000000..bc6e271
 +diff -u /tmp/live.sha256 /tmp/copy.sha256
 +```
 +
-+## Adopt, then retry once
++## Adopt, then the same retry
 +
 +`00000N.wav` is clip N of the checksummed `tts/request.json`. The Nth `clips` entry must name that filename, and its reference wav must be in the same checksum file. A different `request.json` hash makes adopt write nothing. Receipts store the ordinal, segment id, text, reference checksum, wav checksum, and request checksum. Resume copies a wav only when the new cue matches that ordinal, segment id, text, and reference checksum. Wav bytes are not modified. A legacy receipt does not prove the clip ran on CUDA.
 +
-+```sh
-+MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
-+python -m backend.app.v1.tts_resume \
-+  --task-root "$SRC" \
-+  --model-path "$MODEL" \
-+  --checksums /tmp/live.sha256
-+```
++Adopt already reported 54 receipts and `wav_bytes_changed: false`. Do not adopt again unless a receipt file is missing. The model directory passed to adopt must still be the directory the worker opens.
 +
-+`--model-path` must be the directory the host passes to VoxCPM. Then one retry. It keeps the old attempt and does not delete it.
++`POST /retry` is the supported continuation of this task. It keeps the task id, increments the attempt, leaves completed steps and their files in place, and runs only steps that did not complete. It does not upload the video again. `rerun` creates a different task. Do not call `rerun` or `delete`, and do not edit the task database.
++
++The first retry returned `PLUGIN_VERSION_UNAVAILABLE` for `youdub.media`. The plan pins `sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3`, the execution identity of `a270415` and `59ef4b4`. Retry accepts a pin when it equals the current identity or when that identity lists the pin in `compatibleIntegrities`. Anything else is refused. The old provider bytes do not contain the CUDA placement, so restoring them would not run this fix. The review in `packages/builtin/src/builtin-compatibility.json` records the current hash and that one predecessor for `youdub.download`, `youdub.media`, `whisper`, `voxcpm`, `demucs`, and `qwen_forced_aligner`. Those providers share the worker files that changed. `youdub.graph` and `youdub.localize` are unchanged, so their pins still match directly. No other old hash is accepted, and the plan's stored pin is not rewritten.
++
++Rebuild and restart the host so the bundle loads that review. Keep the same public origin and launch-token file. Then send the same retry once, with the attempt still at 1:
 +
 +```sh
 +curl -sS -X POST "$ORIGIN/api/youdub/v2" \
 +  -H "content-type: application/json" \
 +  --cookie "$COOKIE" \
-+  -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":ATTEMPT}}"
++  -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":1}}"
 +```
 +
-+Do not call `rerun` or `delete`.
++The new synthesize reads `attempts/*/*/tts/*.wav` under this task. A receipt match is copied. The other cues are generated. An unreceipted wav is not reused.
 +
 +## What to watch on the target GPU
 +
@@ -806,6 +804,14 @@ index 0000000..bc6e271
 +VoxCPM logs `Loading VoxCPM2 once on cuda:0` and `tensors on cuda:0` only after `tts_model.to`. Demucs prints a `tensor_devices` line only after `model.to`. Either process exits `MODEL_NOT_READY` if a CUDA request is still on CPU, and does not continue that stage. Export stays `libx264`. No GPU run was measured in this workspace.
 +
 +## Apply
++
++Already on `dedd29df`:
++
++```sh
++git apply --check artifacts/youdub-provider-compat-since-dedd29d.patch
++git apply artifacts/youdub-provider-compat-since-dedd29d.patch
++npm --prefix apps/harness run build
++```
 +
 +On `59ef4b4`:
 +
@@ -1984,6 +1990,127 @@ index c445495..033e045 100644
          clips = json.loads(result.output_files["speech_clips"].read_text())["clips"]
          segments = []
          for clip in clips:
+diff --git a/packages/builtin/src/builtin-compatibility.json b/packages/builtin/src/builtin-compatibility.json
+index 52a7c23..2ee1d4b 100644
+--- a/packages/builtin/src/builtin-compatibility.json
++++ b/packages/builtin/src/builtin-compatibility.json
+@@ -1,64 +1,38 @@
+ {
+   "youdub.download": {
+-    "integrity": "sha256:9ba6df2aafe976e698aff1227ecce843b5be3361f559e517fd327f2079b7f998",
++    "integrity": "sha256:3c640d5837dff4a90b64ed4cafddd54e512973ca16c796693a177cf2d7c6dda4",
+     "previous": [
+-      "sha256:d83a6443bd483df945476b09748b83fb030d80173670988af424c008bdbdc65f",
+-      "sha256:57345b32f0396e9a8351c81e0d24a9a9dbb5c03628635aeed71c3d9b7d52c796",
+-      "sha256:e40344408260dc45da5b6879fecb74b0824cc05d803f644e66058b770d33a978",
+-      "sha256:ce045451f5cae25553b111072e2773b5c30354cb2400f5ef9a7e76ef9a06b9e8",
+-      "sha256:6664e2e57500616b8fe82e54faddcf8e7f73f81d3ff8693c27b9532bb0fc2d3d"
++      "sha256:f9cd5624128799de3653e486e1666e70b3a06c84bfbc2b40c5305a5334edf950"
+     ]
+   },
+   "youdub.media": {
+-    "integrity": "sha256:f26229b56cd3b2d238998e0da85c0162a9bd4709bdd2c2b07928bb01a960c866",
++    "integrity": "sha256:320b5cb56bbeabf4f3182b2aefd6a4d3d0bb587db218b79635748629ff8870ef",
+     "previous": [
+-      "sha256:7b897c400cc36f910dd1a16b9e30049a2ce0d0a9b00490ab759f435bd2974ff2",
+-      "sha256:145291a927c8ca2c712fcaeef9e7295bd92bbc441e75e8c0858f26cd6aaca79b",
+-      "sha256:3bc297143b6a1f1f0aee329bafae5157f61121673c5a01c90375d02aef205a31",
+-      "sha256:e76c52b30b90ef51072da8d431ad3b032eeb7859af1020307762ae07dc823c89",
+-      "sha256:e854373ee10f056854a96e9c77c188c50ba0bd0b0194de6d8b92b87290af220d",
+-      "sha256:dd73c3919326e592dfa3049196d0f827568b6c0f36cf69cb7b3e14a4c9138e39"
++      "sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3"
+     ]
+   },
+   "whisper": {
+-    "integrity": "sha256:7776c0fcb521227636f8f19f96345b8704b3bdf625c82d3e2da51ac2d1b42dfa",
++    "integrity": "sha256:d2432da3df9de2091d1d07f833514f0df64b5dd6ac6fdf363dd687c883159d08",
+     "previous": [
+-      "sha256:664a95083ee884a1b2d715aae956f7be92ff0b953de7b46dfd672f17742688c1",
+-      "sha256:95ec8d06fdb07288d08765ca02acf8a26c920addfed85ad195937bb45c322a6e",
+-      "sha256:9c4254c5e38468336005e501f76d74b368c94b12e23e608a77faf2ac3e09c1ab",
+-      "sha256:697bcb03960243151b0cf1ff730214f2ca87b1e633e58657280c67443e69c434",
+-      "sha256:1db02163341ec853a13230181b7a739abfed2b1de1cb9309c1cf07feeb1183f2"
++      "sha256:e04783bad9df83f72b801c0cdc0c40aa4cb18e4761eb5f35cb4af0e9a7a87c15"
+     ]
+   },
+   "voxcpm": {
+-    "integrity": "sha256:3f2bde9c926dd512dd9e00009d51456f4e5b0409925ecbd7727a18d7f18576d2",
++    "integrity": "sha256:611aa179d86c15dfa7e87436dda664f69aa279b829289a83040d946fc0fa6d75",
+     "previous": [
+-      "sha256:787f1fd47b1de0191d4596de4910f0e1d94239e4967c93b5c99b72dfa19a04d7",
+-      "sha256:6a38efe382f7f5c9bbc274a121d0fc1a53419ea48eb26b6c3fd85f7966834473",
+-      "sha256:70047ed06d353e13e8dd3cfbd30b38d1bf5e120342718cbc598db7cc94f93b9c",
+-      "sha256:90a7ed922d2549377fec708394dbfa591e70a4cbf3a2e941d69ce66466feeac0",
+-      "sha256:8dc2539c1f02bddd16d985b226873e96de4736b58b9558b54ce953f7b667d542",
+-      "sha256:c9f09cd6d171430c457e692fe25f63717d29a6976bad5ab1a9b45cd0fab99b4b"
++      "sha256:ef4d0a6c1df36e15d890cd2290e0fc1f0e540294a47fd40177d6221d3ba71c6f"
+     ]
+   },
+   "demucs": {
+-    "integrity": "sha256:3b7721e07ba5b2ee81cf795866c3ae60ab4713152bc8fdde58a059d9a21eb94b",
++    "integrity": "sha256:4897b3e4c21774a0cc8f076a0a502229ff6f213efe67eed1fb37eadb74e6bce2",
+     "previous": [
+-      "sha256:591c17d568760da4a1125227e1598217126589535448f1d0480205c4ff6cb61d",
+-      "sha256:df934879eb2d5a671ac1020ee0d0d7e0d97d184c7db3689cd3e0300ddfb6f1c9",
+-      "sha256:c5e628df7371d109bd9a29e66f4b86e2262eea6ac77e80200dc3bf8e971af315",
+-      "sha256:88664eeb3b05ae32b2711901052356cf0d7ac389959253dfbdb5f46837a6faac",
+-      "sha256:86ec6bd14a35163b4b4a9998b4ed14306a44f4c1fa992251c4cff5fa8283dc7c"
++      "sha256:cd94b870dfcf23872842631546825dbd13e48486408a377c6511d155df3e9526"
+     ]
+   },
+   "qwen_forced_aligner": {
+-    "integrity": "sha256:f709dbd66cd660f453cb401b571010c46082de31787d09d3b11390da0fbf9e94",
++    "integrity": "sha256:1e9787ad6d2fa062b23a820e9bc7dbd7d87cf125e47c651537ddb0f41c3bf134",
+     "previous": [
+-      "sha256:f85681739271c6dd9e2472de34da44e3ee2fcc8a4d3e6cd8d34ad3fa3087cda6",
+-      "sha256:68aace19d98c7d2b1be4b33889fc71a285ba8e2831a165ef12ec4ad415d8b259",
+-      "sha256:29da7e0ffca747bb90ca6529765a88f8d5480b45fa3cf2d0b704ecee6c4e2013",
+-      "sha256:254f6f6e4316bb875c7545eaf3ebc734ad55f6179cee3308b26f0893bf39d1e5",
+-      "sha256:d796e6ed1cd229e0ab6cbe459875ec64ca66590ee1126aee92ddfbb553dcaca9"
++      "sha256:922d210897cf2df75d7e26d0e02ae6ffbd997e986e0cd50c7cd7f0d6a799375b"
+     ]
+   },
+   "youdub.localize": {
+diff --git a/packages/builtin/test/builtin-integrity.test.ts b/packages/builtin/test/builtin-integrity.test.ts
+index c89d141..165939e 100644
+--- a/packages/builtin/test/builtin-integrity.test.ts
++++ b/packages/builtin/test/builtin-integrity.test.ts
+@@ -1,5 +1,6 @@
+ import { test } from 'node:test'
+ import assert from 'node:assert/strict'
++import { fileURLToPath } from 'node:url'
+ import { builtinIntegrities, reviewedIntegrities } from '../src/builtin-integrity.js'
+ 
+ test('execution identities ignore settings and templates but change for the affected model implementation', async () => {
+@@ -17,6 +18,28 @@ test('execution identities ignore settings and templates but change for the affe
+   for (const id of Object.keys(before).filter(id => id !== 'whisper')) assert.equal(changed[id].integrity, before[id].integrity, id)
+ })
+ 
++test('the a270415 execution pins are reviewed for this tree and nowhere else', async () => {
++  const root = fileURLToPath(new URL('../../..', import.meta.url))
++  const current = await builtinIntegrities(root)
++  const pinned = {
++    'youdub.download': 'sha256:f9cd5624128799de3653e486e1666e70b3a06c84bfbc2b40c5305a5334edf950',
++    'youdub.media': 'sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3',
++    whisper: 'sha256:e04783bad9df83f72b801c0cdc0c40aa4cb18e4761eb5f35cb4af0e9a7a87c15',
++    voxcpm: 'sha256:ef4d0a6c1df36e15d890cd2290e0fc1f0e540294a47fd40177d6221d3ba71c6f',
++    demucs: 'sha256:cd94b870dfcf23872842631546825dbd13e48486408a377c6511d155df3e9526',
++    qwen_forced_aligner: 'sha256:922d210897cf2df75d7e26d0e02ae6ffbd997e986e0cd50c7cd7f0d6a799375b',
++  }
++  for (const [id, previous] of Object.entries(pinned)) {
++    assert.notEqual(current[id].integrity, previous, id)
++    assert.deepEqual(current[id].compatibleIntegrities, [previous], id)
++    assert.deepEqual(reviewedIntegrities(id, 'sha256:' + 'ab'.repeat(32)), [])
++  }
++  assert.equal(current['youdub.graph'].integrity, 'sha256:abe8c08284a2089850e123937fb58d25747c5bc8405281720e79e323b998a349')
++  assert.equal(current['youdub.localize'].integrity, 'sha256:1aae61ce5bc60a45e160caeec9560f47d5bc98d52efd7a9e6ddbc6eed4afb3bf')
++  assert.deepEqual(current['youdub.graph'].compatibleIntegrities, [])
++  assert.deepEqual(current['youdub.localize'].compatibleIntegrities, [])
++})
++
+ test('a reviewed compatibility mapping expires when the current implementation changes', () => {
+   const records = { provider: { integrity: 'reviewed-current', previous: ['verified-old'] } }
+   assert.deepEqual(reviewedIntegrities('provider', 'reviewed-current', records), ['verified-old'])
 diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
 index c3a6b1d..7bb2189 100644
 --- a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts

@@ -35,7 +35,7 @@ YOUDUB_LAUNCH_TOKEN_FILE=/var/lib/youdub/launch-token
 
 The host still prints one URL at startup so the existing access-link sync can read it. That print is the product URL, not a new log line, and this patch does not write the token anywhere else. After the rebuilt host restarts twice, both printed URLs must carry the same token and the same origin. Confirm with `stat -c %a` that the file is `600`. Do not copy the token into chat.
 
-This token change is host TypeScript. Apply the patch and run `npm run build:framework` before restarting `youdub-host`. The Python worker picks up Demucs, VoxCPM, and libx264 from the checkout on its next process. No model download.
+The token change is host TypeScript and was already built in `dedd29df`. The compatibility review below is bundled into `apps/harness/dist/host.mjs`. After this patch, run `npm --prefix apps/harness run build`, then restart `youdub-host`. `npm run build:framework` is not required again unless `vendor/deepseek-harness` changed. No model download.
 
 ## Before retry
 
@@ -51,28 +51,26 @@ SRC=$(find "$YOUDUB_DATA" -type d -path "*/tasks/$TASK/attempts" -print -quit | 
 diff -u /tmp/live.sha256 /tmp/copy.sha256
 ```
 
-## Adopt, then retry once
+## Adopt, then the same retry
 
 `00000N.wav` is clip N of the checksummed `tts/request.json`. The Nth `clips` entry must name that filename, and its reference wav must be in the same checksum file. A different `request.json` hash makes adopt write nothing. Receipts store the ordinal, segment id, text, reference checksum, wav checksum, and request checksum. Resume copies a wav only when the new cue matches that ordinal, segment id, text, and reference checksum. Wav bytes are not modified. A legacy receipt does not prove the clip ran on CUDA.
 
-```sh
-MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
-python -m backend.app.v1.tts_resume \
-  --task-root "$SRC" \
-  --model-path "$MODEL" \
-  --checksums /tmp/live.sha256
-```
+Adopt already reported 54 receipts and `wav_bytes_changed: false`. Do not adopt again unless a receipt file is missing. The model directory passed to adopt must still be the directory the worker opens.
 
-`--model-path` must be the directory the host passes to VoxCPM. Then one retry. It keeps the old attempt and does not delete it.
+`POST /retry` is the supported continuation of this task. It keeps the task id, increments the attempt, leaves completed steps and their files in place, and runs only steps that did not complete. It does not upload the video again. `rerun` creates a different task. Do not call `rerun` or `delete`, and do not edit the task database.
+
+The first retry returned `PLUGIN_VERSION_UNAVAILABLE` for `youdub.media`. The plan pins `sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3`, the execution identity of `a270415` and `59ef4b4`. Retry accepts a pin when it equals the current identity or when that identity lists the pin in `compatibleIntegrities`. Anything else is refused. The old provider bytes do not contain the CUDA placement, so restoring them would not run this fix. The review in `packages/builtin/src/builtin-compatibility.json` records the current hash and that one predecessor for `youdub.download`, `youdub.media`, `whisper`, `voxcpm`, `demucs`, and `qwen_forced_aligner`. Those providers share the worker files that changed. `youdub.graph` and `youdub.localize` are unchanged, so their pins still match directly. No other old hash is accepted, and the plan's stored pin is not rewritten.
+
+Rebuild and restart the host so the bundle loads that review. Keep the same public origin and launch-token file. Then send the same retry once, with the attempt still at 1:
 
 ```sh
 curl -sS -X POST "$ORIGIN/api/youdub/v2" \
   -H "content-type: application/json" \
   --cookie "$COOKIE" \
-  -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":ATTEMPT}}"
+  -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":1}}"
 ```
 
-Do not call `rerun` or `delete`.
+The new synthesize reads `attempts/*/*/tts/*.wav` under this task. A receipt match is copied. The other cues are generated. An unreceipted wav is not reused.
 
 ## What to watch on the target GPU
 
@@ -84,6 +82,14 @@ pgrep -af 'tts_process.py|separate_process.py'
 VoxCPM logs `Loading VoxCPM2 once on cuda:0` and `tensors on cuda:0` only after `tts_model.to`. Demucs prints a `tensor_devices` line only after `model.to`. Either process exits `MODEL_NOT_READY` if a CUDA request is still on CPU, and does not continue that stage. Export stays `libx264`. No GPU run was measured in this workspace.
 
 ## Apply
+
+Already on `dedd29df`:
+
+```sh
+git apply --check artifacts/youdub-provider-compat-since-dedd29d.patch
+git apply artifacts/youdub-provider-compat-since-dedd29d.patch
+npm --prefix apps/harness run build
+```
 
 On `59ef4b4`:
 
