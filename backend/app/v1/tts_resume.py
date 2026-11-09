@@ -50,7 +50,7 @@ def _load_request(path: Path) -> list[dict]:
     return clips
 
 
-def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str]) -> list[tuple[Path, dict]]:
+def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str]) -> list[tuple[Path, dict, int, str]]:
     """Return receipt writes, or raise before any file is changed."""
     requests = [path for path in checksums if path.name == "request.json" and path.parent.name == "tts"]
     if len(requests) != 1:
@@ -59,23 +59,26 @@ def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str])
     if _sha256(request_path) != checksums[request_path]:
         raise ValueError("request.json does not match the checksum backup.")
     clips = _load_request(request_path)
-    by_output = {}
-    for clip in clips:
-        if not isinstance(clip, dict):
-            raise ValueError("request.json has an invalid clip.")
-        output = Path(str(clip.get("output_path", ""))).resolve()
-        by_output[output] = clip
+    request_sha = checksums[request_path]
     planned = []
     for wav, digest in checksums.items():
         if wav.suffix != ".wav" or wav.parent.name != "tts":
             continue
+        if not wav.stem.isdigit() or len(wav.stem) != 6:
+            raise ValueError(f"{wav.name} is not a six-digit cue ordinal.")
+        ordinal = int(wav.stem)
+        if ordinal < 1 or ordinal > len(clips) or not isinstance(clips[ordinal - 1], dict):
+            raise ValueError(f"{wav.name} has no clip {ordinal} in the checksummed request.")
+        clip = clips[ordinal - 1]
+        if Path(str(clip.get("output_path", ""))).name != wav.name:
+            raise ValueError(
+                f"Checksummed request clip {ordinal} names "
+                f"{Path(str(clip.get('output_path', ''))).name or 'no file'}, not {wav.name}."
+            )
         if _sha256(wav) != digest:
             raise ValueError(f"{wav.name} does not match the checksum backup.")
         if not complete_wav(wav):
             raise ValueError(f"{wav.name} is not a complete mono WAV.")
-        clip = by_output.get(wav)
-        if clip is None:
-            raise ValueError(f"{wav.name} is not an output of the checksummed request.")
         reference = Path(str(clip.get("reference_path", ""))).resolve()
         if not _inside(reference, task_root) or reference not in checksums:
             raise ValueError(f"Reference audio for {wav.name} is not in the checksum backup.")
@@ -83,7 +86,7 @@ def plan_receipts(task_root: Path, model_path: Path, checksums: dict[Path, str])
             raise ValueError(f"Reference audio for {wav.name} does not match the checksum backup.")
         if clip.get("text") is None or clip.get("reference_text") is None or clip.get("segment_id") is None:
             raise ValueError(f"request.json identity for {wav.name} is incomplete.")
-        planned.append((wav, clip))
+        planned.append((wav, clip, ordinal, request_sha))
     if not planned:
         raise ValueError("The checksum file lists no tts wav clips.")
     return planned
@@ -100,9 +103,11 @@ def adopt(task_root: Path, model_path: Path, checksum_path: Path) -> int:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return _fail(str(exc))
     # Every check above succeeded. Receipts are the only files written.
-    for wav, clip in planned:
+    for wav, clip, ordinal, request_sha in planned:
         before = wav.read_bytes()
-        _write_receipt(wav, clip, model_path, None, legacy=True)
+        _write_receipt(
+            wav, clip, model_path, None, legacy=True, ordinal=ordinal, request_sha256=request_sha,
+        )
         if wav.read_bytes() != before:
             return _fail(f"Refusing to continue because {wav.name} changed while writing its receipt.")
     print(json.dumps({"receipts": len(planned), "wav_bytes_changed": False}))

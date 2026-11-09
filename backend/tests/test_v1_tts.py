@@ -424,17 +424,32 @@ class _Parameter:
         self.device = device
 
 
-def _install_vox(monkeypatch, device_name, generated, loaded):
+class _TTS:
+    def __init__(self, device_name):
+        self.sample_rate = 48000
+        self.params = [_Parameter(device_name)]
+        self.placed = []
+
+    def parameters(self):
+        return self.params
+
+    def to(self, device):
+        self.placed.append(device)
+        for parameter in self.params:
+            parameter.device = device
+        return self
+
+
+def _install_vox(monkeypatch, device_name, generated, loaded, start_on="same"):
     def generate(**kwargs):
         generated.append(kwargs)
         return np.full(4800, 0.25)
 
     def load(*args, **kwargs):
-        loaded.append((args, kwargs))
-        return SimpleNamespace(
-            tts_model=SimpleNamespace(sample_rate=48000, parameters=lambda: [_Parameter(device_name)]),
-            generate=generate,
-        )
+        initial = device_name if start_on == "same" else start_on
+        tts_model = _TTS(initial)
+        loaded.append({"args": args, "kwargs": kwargs, "tts": tts_model})
+        return SimpleNamespace(tts_model=tts_model, generate=generate)
 
     monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
 
@@ -443,13 +458,45 @@ def test_cuda_request_fails_closed_when_parameters_stay_on_cpu(context, monkeypa
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
     generated, loaded = [], []
-    _install_vox(monkeypatch, "cpu", generated, loaded)
+
+    class Stuck(_TTS):
+        def to(self, device):
+            self.placed.append(device)
+            return self
+
+    def generate(**kwargs):
+        generated.append(kwargs)
+        return np.full(4800, 0.25)
+
+    def load(*args, **kwargs):
+        loaded.append(kwargs)
+        tts_model = Stuck("cpu")
+        loaded.append(tts_model)
+        return SimpleNamespace(tts_model=tts_model, generate=generate)
+
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
     clips, arguments = child_request(context)
     arguments[arguments.index("--device") + 1] = "cuda:0"
     assert tts_process.main(arguments) == 1
     assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
-    assert len(loaded) == 1 and not generated
+    assert loaded[0]["device"] == "cuda:0" and loaded[1].placed == ["cuda:0"]
+    assert not generated
     assert not any(Path(clip["output_path"]).exists() for clip in clips)
+
+
+def test_cuda_placement_moves_cpu_parameters_before_generate(context, monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+    _install_vox(monkeypatch, "cuda:0", generated, loaded, start_on="cpu")
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 0
+    assert loaded[0]["kwargs"]["device"] == "cuda:0"
+    assert loaded[0]["tts"].placed == ["cuda:0"]
+    assert loaded[0]["tts"].params[0].device == "cuda:0"
+    assert len(generated) == len(clips)
+    assert generated[0]["normalize"] is False and generated[0]["retry_badcase"] is False
 
 
 def test_cuda_request_records_tensor_device_and_loads_once(context, monkeypatch, capsys):

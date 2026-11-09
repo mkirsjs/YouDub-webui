@@ -111,9 +111,13 @@ def _load_receipt(wav: Path) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path) -> bool:
+def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path, ordinal: int) -> bool:
     reference = Path(clip["reference_path"]).resolve()
     if receipt.get("version") != 1 or receipt.get("segment_id") != clip["segment_id"]:
+        return False
+    if receipt.get("ordinal") != ordinal:
+        return False
+    if wav.stem.isdigit() and int(wav.stem) != ordinal:
         return False
     if receipt.get("text") != clip["text"] or receipt.get("reference_text") != clip["reference_text"]:
         return False
@@ -132,10 +136,14 @@ def _receipt_allows(receipt: dict, device: str) -> bool:
     return legacy or receipt.get("device") == device
 
 
-def _write_receipt(wav: Path, clip: dict, model_path: Path, device: str | None, *, legacy: bool) -> None:
+def _write_receipt(
+    wav: Path, clip: dict, model_path: Path, device: str | None, *,
+    legacy: bool, ordinal: int, request_sha256: str | None = None,
+) -> None:
     reference = Path(clip["reference_path"]).resolve()
     payload = {
         "version": 1,
+        "ordinal": ordinal,
         "segment_id": clip["segment_id"],
         "text": clip["text"],
         "reference_text": clip["reference_text"],
@@ -144,6 +152,7 @@ def _write_receipt(wav: Path, clip: dict, model_path: Path, device: str | None, 
         "model_path": str(model_path),
         "device": device,
         "legacy": legacy,
+        "request_sha256": request_sha256,
     }
     path = _receipt_path(wav)
     temporary = path.with_suffix(".json.partial")
@@ -176,32 +185,40 @@ def _prior_wavs(task_root: Path, destination: Path) -> list[Path]:
     return found
 
 
-def _reuse_in_place(clip: dict, model_path: Path, device: str) -> bool:
+def _reuse_in_place(clip: dict, ordinal: int, model_path: Path, device: str) -> bool:
     wav = Path(clip["output_path"])
     receipt = _load_receipt(wav)
     if receipt is None:
         return False
-    return _receipt_allows(receipt, device) and _content_matches(receipt, clip, model_path, wav)
+    return _receipt_allows(receipt, device) and _content_matches(receipt, clip, model_path, wav, ordinal)
 
 
-def _adopt_prior(clip: dict, model_path: Path, device: str, task_root: Path | None) -> bool:
-    """Copy one already-receipted wav. The source file is left where it is."""
+def _adopt_prior(clip: dict, ordinal: int, model_path: Path, device: str, task_root: Path | None) -> bool:
+    """Copy one already-receipted wav of the same ordinal. The source file stays put."""
     if task_root is None:
         return False
     destination = Path(clip["output_path"])
-    if _reuse_in_place(clip, model_path, device):
+    if _reuse_in_place(clip, ordinal, model_path, device):
         return True
+    if not destination.stem.isdigit() or int(destination.stem) != ordinal:
+        return False
     for source in _prior_wavs(task_root, destination):
+        if source.name != destination.name:
+            continue
         receipt = _load_receipt(source)
         if receipt is None or not _receipt_allows(receipt, device):
             continue
-        if not _content_matches(receipt, clip, model_path, source):
+        if not _content_matches(receipt, clip, model_path, source, ordinal):
             continue
         if destination.exists():
             _preserve(destination)
         _copy_wav(source, destination)
-        _write_receipt(destination, clip, model_path, receipt.get("device"), legacy=receipt.get("legacy") is True)
-        return _reuse_in_place(clip, model_path, device)
+        _write_receipt(
+            destination, clip, model_path, receipt.get("device"),
+            legacy=receipt.get("legacy") is True, ordinal=ordinal,
+            request_sha256=receipt.get("request_sha256"),
+        )
+        return _reuse_in_place(clip, ordinal, model_path, device)
     return False
 
 
@@ -218,6 +235,25 @@ def _tensor_devices(model) -> list[str]:
         if text not in found:
             found.append(text)
     return found
+
+
+def _place_tts(model, requested: str) -> list[str]:
+    """Move the loaded VoxCPM2 module onto the requested device.
+
+    voxcpm 2.0.3's public ``from_pretrained(..., device=)`` forwards that
+    string to ``VoxCPM2Model.from_local``, which ends in ``module.to(device)``.
+    The wrapper class itself has no ``to``. Call the module method again so a
+    load that stayed on CPU is actually placed before any cue is generated.
+    """
+    tts = getattr(model, "tts_model", None)
+    move = getattr(tts, "to", None)
+    if requested.startswith("cuda") or requested == "mps":
+        if not callable(move):
+            raise RuntimeError(f"VoxCPM2 tts_model has no to(); cannot place it on {requested}.")
+        move(requested)
+    elif callable(move):
+        move(requested)
+    return _tensor_devices(model)
 
 
 def _require_cuda(requested: str, devices: list[str]) -> str | None:
@@ -267,7 +303,9 @@ def main(argv: list[str] | None = None) -> int:
     total = len(clips)
     pending = []
     for index, clip in enumerate(clips, start=1):
-        if _reuse_in_place(clip, model_path, options.device) or _adopt_prior(clip, model_path, options.device, task_root):
+        if _reuse_in_place(clip, index, model_path, options.device) or _adopt_prior(
+            clip, index, model_path, options.device, task_root,
+        ):
             _publish(progress_path, {
                 "event": "cue", "index": index, "total": total, "reused": True, "seconds": 0,
                 "message": f"VoxCPM2 reused verified cue {index}/{total}",
@@ -303,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         sample_rate = model.tts_model.sample_rate
         if type(sample_rate) is not int or sample_rate <= 0:
             raise ValueError("Invalid model output sample rate")
-        devices = _tensor_devices(model)
+        devices = _place_tts(model, options.device)
         refused = _require_cuda(options.device, devices)
         if refused:
             return _fail("MODEL_NOT_READY", refused)
@@ -318,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     })
     try:
         for index, clip in pending:
-            if Path(clip["output_path"]).exists() and not _reuse_in_place(clip, model_path, options.device):
+            if Path(clip["output_path"]).exists() and not _reuse_in_place(clip, index, model_path, options.device):
                 _preserve(Path(clip["output_path"]))
             started = time.perf_counter()
             waveform = np.asarray(model.generate(
@@ -334,7 +372,10 @@ def main(argv: list[str] | None = None) -> int:
             partial = destination.with_suffix(".partial.wav")
             sf.write(partial, waveform, sample_rate, format="WAV", subtype="PCM_16")
             os.replace(partial, destination)
-            _write_receipt(destination, clip, model_path, options.device, legacy=False)
+            _write_receipt(
+                destination, clip, model_path, options.device, legacy=False, ordinal=index,
+                request_sha256=_sha256(options.request_path.resolve()),
+            )
             elapsed = round(time.perf_counter() - started, 3)
             _publish(progress_path, {
                 "event": "cue", "index": index, "total": total, "reused": False, "seconds": elapsed,

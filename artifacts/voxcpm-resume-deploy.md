@@ -4,9 +4,9 @@ Deployed base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Do not drop the HTTPS
 
 ## What the code does today
 
-`speech.synthesize/v1` runs `tts_process.py` once. `VoxCPM.from_pretrained(..., device=...)` is one call, then `generate` runs once per cue. This repository does not reload the model per cue. It also never reads the parameter device after load, and the UI stays on `Generating translated speech with VoxCPM2` until the process exits.
+Pinned `voxcpm==2.0.3` documents `VoxCPM.from_pretrained(..., device="cuda:0")`. That value is passed into `VoxCPM2Model.from_local`, which loads weights on CPU and finishes with `module.to(device)`. Explicit `cuda` or `cuda:0` raises if CUDA is unavailable; only `device=None` or `"auto"` may fall back. The wrapper class has no `to`. This patch passes `device` into `from_pretrained` and then calls `tts_model.to(device)` before checking parameters and buffers. If they are still not on that device, no cue is generated. The model is loaded once. `generate` keeps the existing `source_clone` arguments.
 
-Cancel leaves synthesize incomplete. `POST /api/youdub/v2` `retry` keeps completed steps, increments the attempt, and runs synthesize in a new directory `tasks/<id>/attempts/<attempt>/<invocationId>/`. It does not delete older attempt directories (`delete` is the call that removes the task tree). It also does not read the 54 wavs. `request.json` is written for every cue before generation, so that file does not prove a wav was produced from that cue. There is no per-cue receipt. A wav without a receipt must not be reused.
+Cancel leaves synthesize incomplete. Retry keeps completed steps and uses a new attempt directory. It does not delete older attempts. `request.json` is written once for the whole list and can be overwritten by a later run, so it is not proof that `000054.wav` came from clip 54. A wav without a receipt is not reused.
 
 ## Before any retry
 
@@ -29,7 +29,7 @@ Stop if `diff` is not empty, if fewer than 54 `tts/*.wav` files are listed, or i
 
 ## Adopt only the checksummed clips
 
-Receipts are written only after every listed wav, its reference wav, and `tts/request.json` match the checksum file. Wav bytes are not modified. A mismatch writes nothing.
+`00000N.wav` is accepted only as clip N in the checksummed `tts/request.json`: the Nth `clips` entry must name that same filename, and that entry's reference wav must be in the same checksum file. If the live `request.json` hash differs from the backup, adopt writes nothing. The receipt stores that ordinal, segment id, exact text, reference checksum, wav checksum, and the request checksum. Resume copies the wav only when the new cue has the same ordinal, segment id, text, and reference checksum. A checksum match with a different cue is not reused. Wav bytes are not modified.
 
 ```sh
 MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
@@ -64,7 +64,7 @@ nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
 pgrep -af tts_process.py
 ```
 
-The task log should show `Loading VoxCPM2 once on cuda:0` and then `VoxCPM2 loaded once; requested cuda:0; tensors on cuda:0`. If parameters are not on `cuda:0`, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt proves checksum identity, not that the original 54 clips ran on CUDA.
+The task log should show `Loading VoxCPM2 once on cuda:0` and then `tensors on cuda:0`. That line is written only after `tts_model.to("cuda:0")`. If the tensors are still elsewhere, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt records the checksummed ordinal and text; it does not prove those 54 clips ran on CUDA. No GPU run was measured here.
 
 ## Apply
 
