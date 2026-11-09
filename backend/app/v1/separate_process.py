@@ -15,6 +15,37 @@ def _fail(code: str, message: str) -> int:
     return 1
 
 
+def place_demucs(model, requested: str) -> list[str]:
+    """Move the loaded Demucs module onto the requested device before apply_model.
+
+    Official ``apply_model(..., device=)`` also calls ``model.to(device)`` for the
+    forward. Calling it here, then reading parameters and buffers, means a CUDA
+    request that stays on CPU never reaches separation. Quality arguments
+    (shifts, split, overlap) are unchanged.
+    """
+    move = getattr(model, "to", None)
+    if not callable(move):
+        raise RuntimeError(f"Demucs model has no to(); cannot place it on {requested}.")
+    move(requested)
+    devices: list[str] = []
+    for method in ("parameters", "buffers"):
+        values = getattr(model, method, None)
+        if not callable(values):
+            continue
+        for tensor in values():
+            device = getattr(tensor, "device", None)
+            if device is None:
+                continue
+            text = str(device)
+            if text not in devices:
+                devices.append(text)
+    if requested.startswith("cuda") or requested == "mps":
+        if not devices or any(device != requested for device in devices):
+            visible = ", ".join(devices) if devices else "unknown"
+            raise RuntimeError(f"Demucs stayed on {visible} after placement on {requested}.")
+    return devices
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     for name in ("model", "audio", "vocals", "background"):
@@ -44,9 +75,13 @@ def main(argv=None) -> int:
         # Pass the already loaded package; do not modify Torch's global loader.
         package = torch.load(checkpoint, map_location="cpu", weights_only=False)
         model = load_model(package).eval()
+        devices = place_demucs(model, options.device)
     except Exception as exc:
         traceback.print_exc()
         return _fail("MODEL_NOT_READY", f"The local Demucs model could not be loaded ({type(exc).__name__}).")
+    print(json.dumps({
+        "event": "device", "requested_device": options.device, "tensor_devices": devices,
+    }), flush=True)
     try:
         samples, rate = sf.read(options.audio_path, dtype="float32", always_2d=True)
         if rate != model.samplerate or samples.shape[1] != model.audio_channels or not np.isfinite(samples).all():

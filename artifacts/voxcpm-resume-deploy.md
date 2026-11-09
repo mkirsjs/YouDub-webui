@@ -1,85 +1,100 @@
-# VoxCPM resume and CUDA check
+# CUDA inference, CPU video encode, stable launch token
 
-Deployed base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Do not drop the HTTPS patch. No GPU benchmark and no backup were done from this workspace. The coordinator server was not contacted.
+Deployed HTTPS base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Keep that exact public origin. This workspace has no GPU. Python tests mock Demucs and VoxCPM. They do not measure CUDA, NVENC, or the saved backup.
 
-## What the code does today
+The target measurement supplied with this change: RTX 4090, driver 610.57.04, torch 2.8.0+cu126, CUDA allocation succeeds. `ffmpeg -encoders` lists `h264_nvenc`, `hevc_nvenc`, and cuvid, and a one-second NVENC session fails with `OpenEncodeSessionEx failed: unsupported device (2)`. Video encode therefore stays on CPU libx264. Do not turn NVENC on from the encoder list.
 
-Pinned `voxcpm==2.0.3` documents `VoxCPM.from_pretrained(..., device="cuda:0")`. That value is passed into `VoxCPM2Model.from_local`, which loads weights on CPU and finishes with `module.to(device)`. Explicit `cuda` or `cuda:0` raises if CUDA is unavailable; only `device=None` or `"auto"` may fall back. The wrapper class has no `to`. This patch passes `device` into `from_pretrained` and then calls `tts_model.to(device)` before checking parameters and buffers. If they are still not on that device, no cue is generated. The model is loaded once. `generate` keeps the existing `source_clone` arguments.
+Supervisor already starts `youdub-host` and nginx. A service restart was tested for auth, API, and WebSocket. A cold reboot was not tested. The launch URL still changes because the host mints a new `?token=` on every process. Set `YOUDUB_LAUNCH_TOKEN_FILE` so the next restart reuses one mode-0600 file.
 
-Cancel leaves synthesize incomplete. Retry keeps completed steps and uses a new attempt directory. It does not delete older attempts. `request.json` is written once for the whole list and can be overwritten by a later run, so it is not proof that `000054.wav` came from clip 54. A wav without a receipt is not reused.
+Task `9280e54b-89e9-42e4-b871-b96ca69734fe` has 129 cues and 54 wavs. Those files were reported backed up and checksummed. This workspace did not re-read them. Do not retry, rerun, or delete until adopt has written receipts against that checksum file.
 
-## Before any retry
+## GPU stages and CPU stages
 
-When the server is reachable again, copy first. Do not retry, rerun, or delete task `9280e54b-89e9-42e4-b871-b96ca69734fe` before the two copies match.
+Use CUDA for a stage only when that stage already has a model device and the placement below succeeds. Do not add a second model load, a hardware-decode filter graph, or an NVENC attempt.
+
+| Stage | Device | What the code does |
+| --- | --- | --- |
+| Demucs separation | CUDA when `separation.device` is `cuda` or `cuda:0` | Load on CPU, call `model.to(device)`, then require every parameter and buffer on that device. `apply_model` still receives `device`, `shifts=1`, `split=True`, `overlap=0.25`. A CUDA request that stays on CPU exits `MODEL_NOT_READY` before separation. |
+| VoxCPM synthesize | CUDA when `tts.device` is `cuda` or `cuda:0` | `VoxCPM.from_pretrained(..., device=)` for pinned `voxcpm==2.0.3`, then `tts_model.to(device)`. Parameters and buffers must land on that device or no cue is generated. One load. `generate` keeps `source_clone` (`normalize=False`, `denoise=False`, `retry_badcase=False`). |
+| Whisper ASR | CUDA when that stage runs and its device is CUDA | Existing `whisper.load_model(..., device=)`. The imported EN+ZH SRT task does not run this stage. |
+| Qwen forced aligner | CUDA when that stage runs and its device is CUDA | Existing `model.to(device)` and `inputs.to(device)`. Imported subtitle timing is not rewritten by this patch. |
+| Video export | CPU libx264 | `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p`, then AAC. The subtitle `subtitles` filter and audio map are unchanged. No `-hwaccel`, no NVENC, no encoder-list probe. |
+| Prepare, Demucs WAV extract, reference slice, mix, BGM, SRT timing | CPU | PCM, `atempo`, and cue timing. These steps have no CUDA model. |
+
+## Stable launch token
+
+There is no upstream flag that keeps the `?token=` value. The cookie signing secret is already stored in the credential directory. The URL token was only in memory.
+
+Set an absolute path in the `youdub-host` supervisor environment. Do not put the token itself in the supervisor file, on the command line, or in nginx. The host creates the file on first start with mode `0600`, or reads it and tightens the mode if it already exists. A symlink or a non-token file stops startup instead of minting a replacement. A missing token, a wrong token, and a foreign origin are still rejected. `YOUDUB_PUBLIC_ORIGIN` stays the same exact origin.
+
+```sh
+# directory must exist and be owned by the host user; do not pre-create a world-readable file
+YOUDUB_PUBLIC_ORIGIN=https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn
+YOUDUB_LAUNCH_TOKEN_FILE=/var/lib/youdub/launch-token
+```
+
+The host still prints one URL at startup so the existing access-link sync can read it. That print is the product URL, not a new log line, and this patch does not write the token anywhere else. After the rebuilt host restarts twice, both printed URLs must carry the same token and the same origin. Confirm with `stat -c %a` that the file is `600`. Do not copy the token into chat.
+
+This token change is host TypeScript. Apply the patch and run `npm run build:framework` before restarting `youdub-host`. The Python worker picks up Demucs, VoxCPM, and libx264 from the checkout on its next process. No model download.
+
+## Before retry
+
+Confirm the reported backup still matches the live task. Do not replace that backup, and do not retry if the checksums differ or fewer than 54 `tts/*.wav` files are present.
 
 ```sh
 TASK=9280e54b-89e9-42e4-b871-b96ca69734fe
-# data root is the YouDub data directory (Files root), not the git checkout
 find "$YOUDUB_DATA" -type d -path "*/tasks/$TASK/attempts" -print
 SRC=$(find "$YOUDUB_DATA" -type d -path "*/tasks/$TASK/attempts" -print -quit | sed 's:/attempts$::')
-BACKUP=/workspace/youdub-backup/$TASK-$(date +%Y%m%d%H%M%S)
-mkdir -p "$BACKUP"
-cp -a "$SRC" "$BACKUP/task"
-( cd "$SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "$BACKUP/live.sha256"
-( cd "$BACKUP/task" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "$BACKUP/copy.sha256"
-diff -u "$BACKUP/live.sha256" "$BACKUP/copy.sha256"
+# BACKUP is the existing checksummed copy, not a new one
+( cd "$SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/live.sha256
+( cd "$BACKUP/task" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/copy.sha256
+diff -u /tmp/live.sha256 /tmp/copy.sha256
 ```
 
-Stop if `diff` is not empty, if fewer than 54 `tts/*.wav` files are listed, or if any file is empty. Keep `$BACKUP` outside the task directory.
+## Adopt, then retry once
 
-## Adopt only the checksummed clips
-
-`00000N.wav` is accepted only as clip N in the checksummed `tts/request.json`: the Nth `clips` entry must name that same filename, and that entry's reference wav must be in the same checksum file. If the live `request.json` hash differs from the backup, adopt writes nothing. The receipt stores that ordinal, segment id, exact text, reference checksum, wav checksum, and the request checksum. Resume copies the wav only when the new cue has the same ordinal, segment id, text, and reference checksum. A checksum match with a different cue is not reused. Wav bytes are not modified.
+`00000N.wav` is clip N of the checksummed `tts/request.json`. The Nth `clips` entry must name that filename, and its reference wav must be in the same checksum file. A different `request.json` hash makes adopt write nothing. Receipts store the ordinal, segment id, text, reference checksum, wav checksum, and request checksum. Resume copies a wav only when the new cue matches that ordinal, segment id, text, and reference checksum. Wav bytes are not modified. A legacy receipt does not prove the clip ran on CUDA.
 
 ```sh
 MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
 python -m backend.app.v1.tts_resume \
   --task-root "$SRC" \
   --model-path "$MODEL" \
-  --checksums "$BACKUP/live.sha256"
+  --checksums /tmp/live.sha256
 ```
 
-`--model-path` must be the same directory the host will pass to VoxCPM. The command refuses references that are outside the task or absent from the checksum file.
-
-## Then retry once
-
-Retry does not delete the old attempt. After receipts exist, the new synthesize copies a clip only when the receipt matches the current text, reference checksum, model path, and wav checksum. Other cues are generated. An unreceipted wav is never treated as finished.
+`--model-path` must be the directory the host passes to VoxCPM. Then one retry. It keeps the old attempt and does not delete it.
 
 ```sh
-# read attempt from the task, then:
 curl -sS -X POST "$ORIGIN/api/youdub/v2" \
   -H "content-type: application/json" \
   --cookie "$COOKIE" \
   -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":ATTEMPT}}"
 ```
 
-Do not call `rerun` or `delete` for this recovery. `rerun` starts another task and does not carry an unfinished synthesize directory.
+Do not call `rerun` or `delete`.
 
-## GPU check while synthesize is running
-
-This repository's tests mock VoxCPM. They do not measure a GPU. On the server:
+## What to watch on the target GPU
 
 ```sh
 nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
-pgrep -af tts_process.py
+pgrep -af 'tts_process.py|separate_process.py'
 ```
 
-The task log should show `Loading VoxCPM2 once on cuda:0` and then `tensors on cuda:0`. That line is written only after `tts_model.to("cuda:0")`. If the tensors are still elsewhere, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt records the checksummed ordinal and text; it does not prove those 54 clips ran on CUDA. No GPU run was measured here.
+VoxCPM logs `Loading VoxCPM2 once on cuda:0` and `tensors on cuda:0` only after `tts_model.to`. Demucs prints a `tensor_devices` line only after `model.to`. Either process exits `MODEL_NOT_READY` if a CUDA request is still on CPU, and does not continue that stage. Export stays `libx264`. No GPU run was measured in this workspace.
 
 ## Apply
 
-Already on `59ef4b4`:
+On `59ef4b4`:
 
 ```sh
 git apply --check artifacts/youdub-voxcpm-resume-since-59ef4b4.patch
 git apply artifacts/youdub-voxcpm-resume-since-59ef4b4.patch
 ```
 
-Fresh `a270415` tree, including the HTTPS fix:
+On `a270415`, including the HTTPS origin fix:
 
 ```sh
 git apply --check artifacts/youdub-since-a270415.patch
 git apply artifacts/youdub-since-a270415.patch
 ```
-
-Python only. `npm run build:framework` is not required for this change. Restart the host after the patch so the worker loads it. No model download.

@@ -1,6 +1,8 @@
 /** Browser-session authentication for the Host Connection carrier. */
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { chmodSync, closeSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
 import type { PeerId } from '@deepseek-ai/dsh-typert-protocol'
 import { CONNECT_PATH, type ConnectionInteractions } from './connect-protocol.ts'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
@@ -58,10 +60,52 @@ function decodeBase64Url(value: string): Buffer | undefined {
   return encodeBase64Url(decoded) === value ? decoded : undefined
 }
 
-function processLaunchToken(owner: object): string {
+function readLaunchTokenFile(file: string): string {
+  const stat = lstatSync(file)
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error('client-connection: launch token file must be a regular file')
+  }
+  const token = readFileSync(file, 'utf8').trim()
+  const decoded = decodeBase64Url(token)
+  if (decoded === undefined || decoded.length !== SECRET_BYTES) {
+    throw new Error('client-connection: launch token file is invalid')
+  }
+  chmodSync(file, 0o600)
+  return token
+}
+
+function persistentLaunchToken(file: string): string {
+  if (!isAbsolute(file)) {
+    throw new Error('client-connection: launch token file must be an absolute path')
+  }
+  try {
+    return readLaunchTokenFile(file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  const token = encodeBase64Url(randomBytes(SECRET_BYTES))
+  let fd: number
+  try {
+    fd = openSync(file, 'wx', 0o600)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    return readLaunchTokenFile(file)
+  }
+  try {
+    writeSync(fd, `${token}\n`)
+  } finally {
+    closeSync(fd)
+  }
+  chmodSync(file, 0o600)
+  return token
+}
+
+function processLaunchToken(owner: object, file?: string): string {
   const existing = PROCESS_LAUNCH_TOKENS.get(owner)
   if (existing !== undefined) return existing
-  const created = encodeBase64Url(randomBytes(SECRET_BYTES))
+  const created = file === undefined || file === ''
+    ? encodeBase64Url(randomBytes(SECRET_BYTES))
+    : persistentLaunchToken(file)
   PROCESS_LAUNCH_TOKENS.set(owner, created)
   return created
 }
@@ -211,8 +255,9 @@ export class BrowserAuth {
     processOwner: object,
     private readonly secret: Buffer,
     maxAgeDays: number,
+    launchTokenFile?: string,
   ) {
-    this.launchToken = processLaunchToken(processOwner)
+    this.launchToken = processLaunchToken(processOwner, launchTokenFile)
     this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
     if (!Number.isSafeInteger(this.maxAgeMilliseconds)
       || !Number.isSafeInteger(Date.now() + this.maxAgeMilliseconds)) {
@@ -226,14 +271,18 @@ export class BrowserAuth {
    * @param processOwner - root application context retaining one token across Connection reloads.
    * @param credentials - persistent credential provider for the Web profile.
    * @param maxAgeDays - positive absolute browser-cookie lifetime in days.
+   * @param launchTokenFile - absolute path of an optional mode-0600 token file.
+   *   When set, the same `?token=` value is reused across process starts. The
+   *   file contents are not written to a log. Omit it to keep a process-local token.
    * @returns initialized authentication owner with the process owner's launch token.
    */
   static async create(
     processOwner: object,
     credentials: CredentialProvider,
     maxAgeDays: number,
+    launchTokenFile?: string,
   ): Promise<BrowserAuth> {
-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
+    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays, launchTokenFile)
   }
 
   /**

@@ -1,12 +1,13 @@
 diff --git a/apps/harness/cordis.patch.yml b/apps/harness/cordis.patch.yml
-index 0e64d9a..4540a77 100644
+index 0e64d9a..2d28d23 100644
 --- a/apps/harness/cordis.patch.yml
 +++ b/apps/harness/cordis.patch.yml
-@@ -70,6 +70,7 @@
+@@ -70,6 +70,8 @@
          - webStartup
        config:
          trustedHosts: !!js ctx.webStartup.trustedHosts
 +        publicOrigin: !!js ctx.webStartup.publicOrigin
++        launchTokenFile: !!js ctx.webStartup.launchTokenFile
      - id: api-remotes
        name: '@deepseek-ai/dsh-api-remotes'
      - id: ui-theme
@@ -46,10 +47,10 @@ index 0000000..f24a036
 +}
 diff --git a/apps/harness/test/public-origin-proxy.integration.mjs b/apps/harness/test/public-origin-proxy.integration.mjs
 new file mode 100644
-index 0000000..77bff94
+index 0000000..925b848
 --- /dev/null
 +++ b/apps/harness/test/public-origin-proxy.integration.mjs
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,559 @@
 +/**
 + * Exact public-origin proxy: API and WebSocket admission, cookies, and auth.
 + * Requests carry the headers nginx sends to the loopback host.
@@ -57,7 +58,9 @@ index 0000000..77bff94
 +import test from 'node:test'
 +import assert from 'node:assert/strict'
 +import { createHash, randomBytes } from 'node:crypto'
++import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 +import { readFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
 +import { createServer, request as httpRequest } from 'node:http'
 +import { registerHooks } from 'node:module'
 +import { dirname, join } from 'node:path'
@@ -358,9 +361,11 @@ index 0000000..77bff94
 +  const startup = await readFile(join(sourceRoot, 'packages/bundle/web-app/src/startup.ts'), 'utf8')
 +  assert.match(startup, /--public-origin/)
 +  assert.match(startup, /YOUDUB_PUBLIC_ORIGIN/)
++  assert.match(startup, /YOUDUB_LAUNCH_TOKEN_FILE/)
 +  assert.match(startup, /selectConfiguredPublicOrigin/)
 +  const patch = await readFile(join(here, '../cordis.patch.yml'), 'utf8')
 +  assert.match(patch, /publicOrigin: !!js ctx\.webStartup\.publicOrigin/)
++  assert.match(patch, /launchTokenFile: !!js ctx\.webStartup\.launchTokenFile/)
 +})
 +
 +test('authenticated external origin reaches API and WebSocket; bad token, foreign origin, and localhost stay distinct', { timeout: 10_000 }, async () => {
@@ -541,12 +546,76 @@ index 0000000..77bff94
 +  }
 +})
 +
++test('a mode 0600 launch-token file keeps the same URL token across process owners', async () => {
++  const directory = mkdtempSync(join(tmpdir(), 'youdub-launch-token-'))
++  const file = join(directory, 'launch-token')
++  try {
++    const first = await BrowserAuth.create({ owner: 'boot-1' }, memoryCredentials(), 30, file)
++    const mode = lstatSync(file).mode & 0o777
++    assert.equal(mode, 0o600)
++    const saved = readFileSync(file, 'utf8').trim()
++    const firstUrl = new URL(first.authenticatedUrl(`${PUBLIC_ORIGIN}/`))
++    assert.equal(firstUrl.origin, PUBLIC_ORIGIN)
++    assert.equal(firstUrl.searchParams.get('token'), saved)
++
++    chmodSync(file, 0o644)
++    const second = await BrowserAuth.create({ owner: 'boot-2' }, memoryCredentials(), 30, file)
++    assert.equal(lstatSync(file).mode & 0o777, 0o600)
++    const secondUrl = new URL(second.authenticatedUrl(`${PUBLIC_ORIGIN}/`))
++    assert.equal(secondUrl.origin, PUBLIC_ORIGIN)
++    assert.equal(secondUrl.searchParams.get('token'), saved)
++
++    const accepted = []
++    const granted = second.authorizeIndex({
++      method: 'GET',
++      url: `/?token=${saved}`,
++      headers: { host: `127.0.0.1:3086` },
++    }, {
++      writeHead(status, headers) { accepted.push({ status, headers }) },
++      end() {},
++    }, false)
++    assert.equal(granted, false)
++    assert.equal(accepted[0].status, 303)
++    assert.match(accepted[0].headers['set-cookie'], /HttpOnly/)
++
++    const rejected = []
++    second.authorizeIndex({
++      method: 'GET',
++      url: '/?token=different-token',
++      headers: { host: `127.0.0.1:3086` },
++    }, {
++      writeHead(status) { rejected.push(status) },
++      end() {},
++    }, false)
++    assert.equal(rejected[0], 401)
++
++    const link = join(directory, 'linked-token')
++    symlinkSync(file, link)
++    await assert.rejects(
++      () => BrowserAuth.create({ owner: 'boot-3' }, memoryCredentials(), 30, link),
++      /regular file/,
++    )
++    await assert.rejects(
++      () => BrowserAuth.create({ owner: 'boot-4' }, memoryCredentials(), 30, 'launch-token'),
++      /absolute path/,
++    )
++    writeFileSync(file, 'not-a-token\n', { mode: 0o600 })
++    await assert.rejects(
++      () => BrowserAuth.create({ owner: 'boot-5' }, memoryCredentials(), 30, file),
++      /invalid/,
++    )
++    assert.equal(readFileSync(file, 'utf8'), 'not-a-token\n')
++  } finally {
++    rmSync(directory, { recursive: true, force: true })
++  }
++})
++
 diff --git a/artifacts/public-origin-deploy.md b/artifacts/public-origin-deploy.md
 new file mode 100644
-index 0000000..0ee33ba
+index 0000000..11f3425
 --- /dev/null
 +++ b/artifacts/public-origin-deploy.md
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,98 @@
 +# HTTPS public origin for the loopback host
 +
 +Apply this on deployed commit `a27041552f5bff69e2ec04f1fae1402f4d7ba5f1`. Do not hand-edit `node_modules` or `dist`. Do not print the launch token in chat.
@@ -576,6 +645,8 @@ index 0000000..0ee33ba
 +```
 +
 +The same value may be passed as `--public-origin` after `--no-open`. One exact origin. A wildcard, path, or second host is rejected at startup. Unset, localhost behavior is unchanged.
++
++Without `YOUDUB_LAUNCH_TOKEN_FILE`, the printed `?token=` is a new random value on every process. Set that absolute path, as described in `artifacts/voxcpm-resume-deploy.md`, to reuse one mode-0600 file. The origin check, cookie signing, and rejection of a missing or foreign token stay the same.
 +
 +Restart that process in its existing tmux/nohup session. The log line `YouDub web: https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn/?token=...` is the browser URL.
 +
@@ -645,95 +716,145 @@ index 0000000..0ee33ba
 +Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
 diff --git a/artifacts/voxcpm-resume-deploy.md b/artifacts/voxcpm-resume-deploy.md
 new file mode 100644
-index 0000000..1b8a933
+index 0000000..bc6e271
 --- /dev/null
 +++ b/artifacts/voxcpm-resume-deploy.md
-@@ -0,0 +1,85 @@
-+# VoxCPM resume and CUDA check
+@@ -0,0 +1,100 @@
++# CUDA inference, CPU video encode, stable launch token
 +
-+Deployed base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Do not drop the HTTPS patch. No GPU benchmark and no backup were done from this workspace. The coordinator server was not contacted.
++Deployed HTTPS base: `59ef4b4599927f7ee139fb4e1d836ac7d533d0f3`. Keep that exact public origin. This workspace has no GPU. Python tests mock Demucs and VoxCPM. They do not measure CUDA, NVENC, or the saved backup.
 +
-+## What the code does today
++The target measurement supplied with this change: RTX 4090, driver 610.57.04, torch 2.8.0+cu126, CUDA allocation succeeds. `ffmpeg -encoders` lists `h264_nvenc`, `hevc_nvenc`, and cuvid, and a one-second NVENC session fails with `OpenEncodeSessionEx failed: unsupported device (2)`. Video encode therefore stays on CPU libx264. Do not turn NVENC on from the encoder list.
 +
-+Pinned `voxcpm==2.0.3` documents `VoxCPM.from_pretrained(..., device="cuda:0")`. That value is passed into `VoxCPM2Model.from_local`, which loads weights on CPU and finishes with `module.to(device)`. Explicit `cuda` or `cuda:0` raises if CUDA is unavailable; only `device=None` or `"auto"` may fall back. The wrapper class has no `to`. This patch passes `device` into `from_pretrained` and then calls `tts_model.to(device)` before checking parameters and buffers. If they are still not on that device, no cue is generated. The model is loaded once. `generate` keeps the existing `source_clone` arguments.
++Supervisor already starts `youdub-host` and nginx. A service restart was tested for auth, API, and WebSocket. A cold reboot was not tested. The launch URL still changes because the host mints a new `?token=` on every process. Set `YOUDUB_LAUNCH_TOKEN_FILE` so the next restart reuses one mode-0600 file.
 +
-+Cancel leaves synthesize incomplete. Retry keeps completed steps and uses a new attempt directory. It does not delete older attempts. `request.json` is written once for the whole list and can be overwritten by a later run, so it is not proof that `000054.wav` came from clip 54. A wav without a receipt is not reused.
++Task `9280e54b-89e9-42e4-b871-b96ca69734fe` has 129 cues and 54 wavs. Those files were reported backed up and checksummed. This workspace did not re-read them. Do not retry, rerun, or delete until adopt has written receipts against that checksum file.
 +
-+## Before any retry
++## GPU stages and CPU stages
 +
-+When the server is reachable again, copy first. Do not retry, rerun, or delete task `9280e54b-89e9-42e4-b871-b96ca69734fe` before the two copies match.
++Use CUDA for a stage only when that stage already has a model device and the placement below succeeds. Do not add a second model load, a hardware-decode filter graph, or an NVENC attempt.
++
++| Stage | Device | What the code does |
++| --- | --- | --- |
++| Demucs separation | CUDA when `separation.device` is `cuda` or `cuda:0` | Load on CPU, call `model.to(device)`, then require every parameter and buffer on that device. `apply_model` still receives `device`, `shifts=1`, `split=True`, `overlap=0.25`. A CUDA request that stays on CPU exits `MODEL_NOT_READY` before separation. |
++| VoxCPM synthesize | CUDA when `tts.device` is `cuda` or `cuda:0` | `VoxCPM.from_pretrained(..., device=)` for pinned `voxcpm==2.0.3`, then `tts_model.to(device)`. Parameters and buffers must land on that device or no cue is generated. One load. `generate` keeps `source_clone` (`normalize=False`, `denoise=False`, `retry_badcase=False`). |
++| Whisper ASR | CUDA when that stage runs and its device is CUDA | Existing `whisper.load_model(..., device=)`. The imported EN+ZH SRT task does not run this stage. |
++| Qwen forced aligner | CUDA when that stage runs and its device is CUDA | Existing `model.to(device)` and `inputs.to(device)`. Imported subtitle timing is not rewritten by this patch. |
++| Video export | CPU libx264 | `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p`, then AAC. The subtitle `subtitles` filter and audio map are unchanged. No `-hwaccel`, no NVENC, no encoder-list probe. |
++| Prepare, Demucs WAV extract, reference slice, mix, BGM, SRT timing | CPU | PCM, `atempo`, and cue timing. These steps have no CUDA model. |
++
++## Stable launch token
++
++There is no upstream flag that keeps the `?token=` value. The cookie signing secret is already stored in the credential directory. The URL token was only in memory.
++
++Set an absolute path in the `youdub-host` supervisor environment. Do not put the token itself in the supervisor file, on the command line, or in nginx. The host creates the file on first start with mode `0600`, or reads it and tightens the mode if it already exists. A symlink or a non-token file stops startup instead of minting a replacement. A missing token, a wrong token, and a foreign origin are still rejected. `YOUDUB_PUBLIC_ORIGIN` stays the same exact origin.
++
++```sh
++# directory must exist and be owned by the host user; do not pre-create a world-readable file
++YOUDUB_PUBLIC_ORIGIN=https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn
++YOUDUB_LAUNCH_TOKEN_FILE=/var/lib/youdub/launch-token
++```
++
++The host still prints one URL at startup so the existing access-link sync can read it. That print is the product URL, not a new log line, and this patch does not write the token anywhere else. After the rebuilt host restarts twice, both printed URLs must carry the same token and the same origin. Confirm with `stat -c %a` that the file is `600`. Do not copy the token into chat.
++
++This token change is host TypeScript. Apply the patch and run `npm run build:framework` before restarting `youdub-host`. The Python worker picks up Demucs, VoxCPM, and libx264 from the checkout on its next process. No model download.
++
++## Before retry
++
++Confirm the reported backup still matches the live task. Do not replace that backup, and do not retry if the checksums differ or fewer than 54 `tts/*.wav` files are present.
 +
 +```sh
 +TASK=9280e54b-89e9-42e4-b871-b96ca69734fe
-+# data root is the YouDub data directory (Files root), not the git checkout
 +find "$YOUDUB_DATA" -type d -path "*/tasks/$TASK/attempts" -print
 +SRC=$(find "$YOUDUB_DATA" -type d -path "*/tasks/$TASK/attempts" -print -quit | sed 's:/attempts$::')
-+BACKUP=/workspace/youdub-backup/$TASK-$(date +%Y%m%d%H%M%S)
-+mkdir -p "$BACKUP"
-+cp -a "$SRC" "$BACKUP/task"
-+( cd "$SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "$BACKUP/live.sha256"
-+( cd "$BACKUP/task" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "$BACKUP/copy.sha256"
-+diff -u "$BACKUP/live.sha256" "$BACKUP/copy.sha256"
++# BACKUP is the existing checksummed copy, not a new one
++( cd "$SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/live.sha256
++( cd "$BACKUP/task" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/copy.sha256
++diff -u /tmp/live.sha256 /tmp/copy.sha256
 +```
 +
-+Stop if `diff` is not empty, if fewer than 54 `tts/*.wav` files are listed, or if any file is empty. Keep `$BACKUP` outside the task directory.
++## Adopt, then retry once
 +
-+## Adopt only the checksummed clips
-+
-+`00000N.wav` is accepted only as clip N in the checksummed `tts/request.json`: the Nth `clips` entry must name that same filename, and that entry's reference wav must be in the same checksum file. If the live `request.json` hash differs from the backup, adopt writes nothing. The receipt stores that ordinal, segment id, exact text, reference checksum, wav checksum, and the request checksum. Resume copies the wav only when the new cue has the same ordinal, segment id, text, and reference checksum. A checksum match with a different cue is not reused. Wav bytes are not modified.
++`00000N.wav` is clip N of the checksummed `tts/request.json`. The Nth `clips` entry must name that filename, and its reference wav must be in the same checksum file. A different `request.json` hash makes adopt write nothing. Receipts store the ordinal, segment id, text, reference checksum, wav checksum, and request checksum. Resume copies a wav only when the new cue matches that ordinal, segment id, text, and reference checksum. Wav bytes are not modified. A legacy receipt does not prove the clip ran on CUDA.
 +
 +```sh
 +MODEL=${YOUDUB_VOXCPM_MODEL_DIR:-$YOUDUB_DATA/models/voxcpm/VoxCPM2}
 +python -m backend.app.v1.tts_resume \
 +  --task-root "$SRC" \
 +  --model-path "$MODEL" \
-+  --checksums "$BACKUP/live.sha256"
++  --checksums /tmp/live.sha256
 +```
 +
-+`--model-path` must be the same directory the host will pass to VoxCPM. The command refuses references that are outside the task or absent from the checksum file.
-+
-+## Then retry once
-+
-+Retry does not delete the old attempt. After receipts exist, the new synthesize copies a clip only when the receipt matches the current text, reference checksum, model path, and wav checksum. Other cues are generated. An unreceipted wav is never treated as finished.
++`--model-path` must be the directory the host passes to VoxCPM. Then one retry. It keeps the old attempt and does not delete it.
 +
 +```sh
-+# read attempt from the task, then:
 +curl -sS -X POST "$ORIGIN/api/youdub/v2" \
 +  -H "content-type: application/json" \
 +  --cookie "$COOKIE" \
 +  -d "{\"method\":\"POST\",\"path\":\"/api/v2/tasks/$TASK/retry\",\"body\":{\"expectedAttempt\":ATTEMPT}}"
 +```
 +
-+Do not call `rerun` or `delete` for this recovery. `rerun` starts another task and does not carry an unfinished synthesize directory.
++Do not call `rerun` or `delete`.
 +
-+## GPU check while synthesize is running
-+
-+This repository's tests mock VoxCPM. They do not measure a GPU. On the server:
++## What to watch on the target GPU
 +
 +```sh
 +nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
-+pgrep -af tts_process.py
++pgrep -af 'tts_process.py|separate_process.py'
 +```
 +
-+The task log should show `Loading VoxCPM2 once on cuda:0` and then `tensors on cuda:0`. That line is written only after `tts_model.to("cuda:0")`. If the tensors are still elsewhere, the process exits `MODEL_NOT_READY` and does not generate. Later lines are `generated cue N/129 in Xs` or `reused verified cue N/129`. A legacy receipt records the checksummed ordinal and text; it does not prove those 54 clips ran on CUDA. No GPU run was measured here.
++VoxCPM logs `Loading VoxCPM2 once on cuda:0` and `tensors on cuda:0` only after `tts_model.to`. Demucs prints a `tensor_devices` line only after `model.to`. Either process exits `MODEL_NOT_READY` if a CUDA request is still on CPU, and does not continue that stage. Export stays `libx264`. No GPU run was measured in this workspace.
 +
 +## Apply
 +
-+Already on `59ef4b4`:
++On `59ef4b4`:
 +
 +```sh
 +git apply --check artifacts/youdub-voxcpm-resume-since-59ef4b4.patch
 +git apply artifacts/youdub-voxcpm-resume-since-59ef4b4.patch
 +```
 +
-+Fresh `a270415` tree, including the HTTPS fix:
++On `a270415`, including the HTTPS origin fix:
 +
 +```sh
 +git apply --check artifacts/youdub-since-a270415.patch
 +git apply artifacts/youdub-since-a270415.patch
 +```
+diff --git a/backend/app/v1/export.py b/backend/app/v1/export.py
+index 4d4bc81..7bf8320 100644
+--- a/backend/app/v1/export.py
++++ b/backend/app/v1/export.py
+@@ -28,6 +28,19 @@ SUBTITLE_FONT_SIZES = {
+ SUBTITLE_BREAK_PUNCTUATION = "，,；;：:。?？!！、.—"
+ 
+ 
++def video_encoder_args() -> list[str]:
++    """Encode the output video on CPU with libx264.
 +
-+Python only. `npm run build:framework` is not required for this change. Restart the host after the patch so the worker loads it. No model download.
++    ``ffmpeg -encoders`` can list ``h264_nvenc`` when the binary was built with
++    NVENC even if the driver refuses a session. On the measured RTX 4090 host a
++    one-second NVENC encode failed with OpenEncodeSessionEx unsupported device,
++    while CUDA allocation for inference succeeded. This path does not probe the
++    encoder list and does not add a hardware decode or filter chain. Audio stays
++    AAC and the subtitle filter is unchanged.
++    """
++    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"]
++
++
+ def _subtitle_style(font: str, size: int, margin_v: int) -> str:
+     return (
+         f"FontName={font},"
+@@ -276,8 +289,8 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
+                                               context.config.target_language)
+         command.extend(["-vf", f"subtitles=filename=translated.srt:force_style='{style}'"])
+     command.extend([
+-        "-map", "0:v:0", "-map", "1:a:0" if include_dubbing else "0:a:0", "-c:v", "libx264",
+-        "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
++        "-map", "0:v:0", "-map", "1:a:0" if include_dubbing else "0:a:0",
++        *video_encoder_args(), "-c:a", "aac", "-movflags", "+faststart",
+         str(final_video.resolve()),
+     ])
+     try:
 diff --git a/backend/app/v1/media.py b/backend/app/v1/media.py
 index 3864cb7..450caf1 100644
 --- a/backend/app/v1/media.py
@@ -763,6 +884,94 @@ index 3864cb7..450caf1 100644
              check_cancel()
          except BaseException:
              if process.poll() is None:
+diff --git a/backend/app/v1/separate.py b/backend/app/v1/separate.py
+index 8d41b56..196286c 100644
+--- a/backend/app/v1/separate.py
++++ b/backend/app/v1/separate.py
+@@ -15,6 +15,20 @@ from ..paths import data_directory
+ MODEL_FILES = {"htdemucs": "955717e8-8726e21a.th"}
+ 
+ 
++def finished_message(stdout: str) -> str:
++    for line in reversed(stdout.splitlines()):
++        try:
++            payload = json.loads(line)
++        except ValueError:
++            continue
++        if payload.get("event") != "device":
++            continue
++        devices = payload.get("tensor_devices")
++        if isinstance(devices, list) and devices and all(isinstance(item, str) and item for item in devices):
++            return f"Demucs tensors on {', '.join(devices)}"
++    return "Vocals and background are ready"
++
++
+ def model_directory() -> Path:
+     configured = os.getenv("YOUDUB_DEMUCS_MODELS_DIR", "").strip()
+     return Path(configured).expanduser().resolve() if configured else data_directory() / "models" / "demucs"
+@@ -75,5 +89,5 @@ def run(context: StageContext, progress) -> Completed:
+                 raise ValueError("Separated audio changed its source timeline or format")
+     except (OSError, RuntimeError, ValueError) as exc:
+         raise ApiError(502, "INVALID_PROVIDER_RESULT", "Separated audio is missing or has invalid timing.", stage="separate") from exc
+-    progress(1.0, "Vocals and background are ready")
++    progress(1.0, finished_message(result.stdout))
+     return Completed(output_files={"vocals": vocals, "background": background})
+diff --git a/backend/app/v1/separate_process.py b/backend/app/v1/separate_process.py
+index 9254a9d..89d5668 100644
+--- a/backend/app/v1/separate_process.py
++++ b/backend/app/v1/separate_process.py
+@@ -15,6 +15,37 @@ def _fail(code: str, message: str) -> int:
+     return 1
+ 
+ 
++def place_demucs(model, requested: str) -> list[str]:
++    """Move the loaded Demucs module onto the requested device before apply_model.
++
++    Official ``apply_model(..., device=)`` also calls ``model.to(device)`` for the
++    forward. Calling it here, then reading parameters and buffers, means a CUDA
++    request that stays on CPU never reaches separation. Quality arguments
++    (shifts, split, overlap) are unchanged.
++    """
++    move = getattr(model, "to", None)
++    if not callable(move):
++        raise RuntimeError(f"Demucs model has no to(); cannot place it on {requested}.")
++    move(requested)
++    devices: list[str] = []
++    for method in ("parameters", "buffers"):
++        values = getattr(model, method, None)
++        if not callable(values):
++            continue
++        for tensor in values():
++            device = getattr(tensor, "device", None)
++            if device is None:
++                continue
++            text = str(device)
++            if text not in devices:
++                devices.append(text)
++    if requested.startswith("cuda") or requested == "mps":
++        if not devices or any(device != requested for device in devices):
++            visible = ", ".join(devices) if devices else "unknown"
++            raise RuntimeError(f"Demucs stayed on {visible} after placement on {requested}.")
++    return devices
++
++
+ def main(argv=None) -> int:
+     parser = argparse.ArgumentParser()
+     for name in ("model", "audio", "vocals", "background"):
+@@ -44,9 +75,13 @@ def main(argv=None) -> int:
+         # Pass the already loaded package; do not modify Torch's global loader.
+         package = torch.load(checkpoint, map_location="cpu", weights_only=False)
+         model = load_model(package).eval()
++        devices = place_demucs(model, options.device)
+     except Exception as exc:
+         traceback.print_exc()
+         return _fail("MODEL_NOT_READY", f"The local Demucs model could not be loaded ({type(exc).__name__}).")
++    print(json.dumps({
++        "event": "device", "requested_device": options.device, "tensor_devices": devices,
++    }), flush=True)
+     try:
+         samples, rate = sf.read(options.audio_path, dtype="float32", always_2d=True)
+         if rate != model.samplerate or samples.shape[1] != model.audio_channels or not np.isfinite(samples).all():
 diff --git a/backend/app/v1/tts.py b/backend/app/v1/tts.py
 index 94ac9f1..dd632d8 100644
 --- a/backend/app/v1/tts.py
@@ -813,7 +1022,7 @@ index 94ac9f1..dd632d8 100644
          try:
              error = json.loads(result.stderr.strip().splitlines()[-1])
 diff --git a/backend/app/v1/tts_process.py b/backend/app/v1/tts_process.py
-index 267a102..0cbba2d 100644
+index 267a102..82e30c0 100644
 --- a/backend/app/v1/tts_process.py
 +++ b/backend/app/v1/tts_process.py
 @@ -1,11 +1,19 @@
@@ -837,7 +1046,7 @@ index 267a102..0cbba2d 100644
  import traceback
  from pathlib import Path
  
-@@ -15,11 +23,254 @@ def _fail(code: str, message: str) -> int:
+@@ -15,11 +23,256 @@ def _fail(code: str, message: str) -> int:
      return 1
  
  
@@ -1041,17 +1250,19 @@ index 267a102..0cbba2d 100644
 +
 +
 +def _tensor_devices(model) -> list[str]:
-+    parameters = getattr(getattr(model, "tts_model", None), "parameters", None)
-+    if not callable(parameters):
-+        return []
++    tts = getattr(model, "tts_model", None)
 +    found = []
-+    for parameter in parameters():
-+        device = getattr(parameter, "device", None)
-+        if device is None:
++    for method in ("parameters", "buffers"):
++        values = getattr(tts, method, None)
++        if not callable(values):
 +            continue
-+        text = str(device)
-+        if text not in found:
-+            found.append(text)
++        for tensor in values():
++            device = getattr(tensor, "device", None)
++            if device is None:
++                continue
++            text = str(device)
++            if text not in found:
++                found.append(text)
 +    return found
 +
 +
@@ -1092,7 +1303,7 @@ index 267a102..0cbba2d 100644
      options = parser.parse_args(argv)
      model_path = options.model_path.resolve()
      if not model_path.is_dir():
-@@ -45,12 +296,38 @@ def main(argv: list[str] | None = None) -> int:
+@@ -45,12 +298,38 @@ def main(argv: list[str] | None = None) -> int:
                  raise ValueError("Reference audio transcript is missing")
      except (OSError, ValueError, KeyError, TypeError):
          return _fail("INPUT_MISSING", "The speech generation request or reference audio is invalid.")
@@ -1132,7 +1343,7 @@ index 267a102..0cbba2d 100644
      try:
          import numpy as np
          import soundfile as sf
-@@ -64,11 +341,24 @@ def main(argv: list[str] | None = None) -> int:
+@@ -64,11 +343,24 @@ def main(argv: list[str] | None = None) -> int:
          sample_rate = model.tts_model.sample_rate
          if type(sample_rate) is not int or sample_rate <= 0:
              raise ValueError("Invalid model output sample rate")
@@ -1158,7 +1369,7 @@ index 267a102..0cbba2d 100644
              waveform = np.asarray(model.generate(
                  text=clip["text"], reference_wav_path=clip["reference_path"],
                  prompt_wav_path=clip["reference_path"], prompt_text=clip["reference_text"],
-@@ -77,7 +367,20 @@ def main(argv: list[str] | None = None) -> int:
+@@ -77,7 +369,20 @@ def main(argv: list[str] | None = None) -> int:
              if (waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all()
                      or np.max(np.abs(waveform)) > 1):
                  raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
@@ -1313,11 +1524,222 @@ index 0000000..5093a15
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/backend/tests/test_v1_export.py b/backend/tests/test_v1_export.py
+index 559e169..16099d5 100644
+--- a/backend/tests/test_v1_export.py
++++ b/backend/tests/test_v1_export.py
+@@ -71,6 +71,9 @@ def test_srt_splits_display_only_preserves_inputs_and_joins_translation_by_id(mo
+     assert "-shortest" not in command
+     assert options["cwd"] == (context.work_dir / "output").resolve()
+     assert "filename=translated.srt" in command[command.index("-vf") + 1]
++    assert command[command.index("-c:v") + 1] == "libx264"
++    assert "h264_nvenc" not in command and "-hwaccel" not in command
++    assert export.video_encoder_args() == ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"]
+     assert all(path.parent == context.work_dir / "output" for path in result.output_files.values())
+ 
+ 
+diff --git a/backend/tests/test_v1_separate.py b/backend/tests/test_v1_separate.py
+index 4094a78..07865f1 100644
+--- a/backend/tests/test_v1_separate.py
++++ b/backend/tests/test_v1_separate.py
+@@ -1,9 +1,12 @@
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import subprocess
+ import sys
+ from dataclasses import replace
+ from pathlib import Path
++from types import ModuleType
+ 
+ import pytest
+ import soundfile as sf
+@@ -101,6 +104,179 @@ def test_demucs_process_is_reaped_on_cancel(context, monkeypatch):
+     assert children[0].poll() is not None
+ 
+ 
++def test_finished_message_reads_the_device_line_only():
++    assert separate.finished_message("") == "Vocals and background are ready"
++    stdout = "\n".join([
++        "not json",
++        json.dumps({"event": "device", "requested_device": "cuda:0", "tensor_devices": ["cuda:0"]}),
++    ])
++    assert separate.finished_message(stdout) == "Demucs tensors on cuda:0"
++
++
++def test_separation_progress_reports_cuda_tensors(context, monkeypatch):
++    real_run = media._run_media
++    data = context.config.model_dump()
++    data["separation"]["device"] = "cuda:0"
++    configured = replace(context, config=TaskConfig.model_validate(data))
++    messages = []
++
++    def invoke(command, **kwargs):
++        if command[0] != sys.executable:
++            return real_run(command, **kwargs)
++        assert command[command.index("--device") + 1] == "cuda:0"
++        source = Path(command[command.index("--audio-path") + 1])
++        samples, rate = sf.read(source, always_2d=True)
++        for flag in ("--vocals-path", "--background-path"):
++            sf.write(command[command.index(flag) + 1], samples, rate, subtype="FLOAT")
++        line = json.dumps({"event": "device", "requested_device": "cuda:0", "tensor_devices": ["cuda:0"]})
++        return subprocess.CompletedProcess(command, 0, line + "\n", "")
++
++    monkeypatch.setattr(media, "_run_media", invoke)
++    separate.run(configured, lambda value, message: messages.append((value, message)))
++    assert messages[-1] == (1.0, "Demucs tensors on cuda:0")
++
++
++class _Digest:
++    def hexdigest(self):
++        return "8726e21a" + "ab" * 28
++
++
++class _Tensor:
++    def __init__(self, array, device="cpu"):
++        self.array = array
++        self.device = device
++
++    def mean(self, axis=None):
++        return _Tensor(self.array.mean(axis=axis), self.device)
++
++    def std(self):
++        return float(self.array.std())
++
++    def _other(self, other):
++        return other.array if isinstance(other, _Tensor) else other
++
++    def __add__(self, other):
++        return _Tensor(self.array + self._other(other), self.device)
++
++    def __radd__(self, other):
++        return self.__add__(other)
++
++    def __sub__(self, other):
++        return _Tensor(self.array - self._other(other), self.device)
++
++    def __mul__(self, other):
++        return _Tensor(self.array * self._other(other), self.device)
++
++    def __truediv__(self, other):
++        return _Tensor(self.array / self._other(other), self.device)
++
++    def __getitem__(self, item):
++        return _Tensor(self.array[item], self.device)
++
++    def numpy(self):
++        return self.array
++
++    def cpu(self):
++        return self
++
++
++def _demucs_child(monkeypatch, tmp_path, *, device, move):
++    import numpy as np
++
++    checkpoint = tmp_path / "955717e8-8726e21a.th"
++    checkpoint.write_bytes(b"checkpoint")
++    audio = tmp_path / "audio.wav"
++    vocals = tmp_path / "vocals.wav"
++    background = tmp_path / "background.wav"
++    samples = np.linspace(-0.2, 0.2, 4410, dtype="float32").reshape(-1, 1).repeat(2, axis=1)
++    sf.write(audio, samples, 44100, subtype="FLOAT")
++    events = []
++
++    class Model:
++        def __init__(self):
++            self.params = [_Tensor(np.zeros(1, dtype="float32"))]
++            self.samplerate = 44100
++            self.audio_channels = 2
++            self.sources = ["drums", "bass", "other", "vocals"]
++
++        def parameters(self):
++            return self.params
++
++        def buffers(self):
++            return []
++
++        def to(self, requested):
++            events.append(("to", requested))
++            move(self, requested)
++            return self
++
++        def eval(self):
++            return self
++
++    model = Model()
++
++    def apply_model(loaded, wav, device=None, **kwargs):
++        events.append(("apply", device, loaded.params[0].device, kwargs["shifts"], kwargs["overlap"], kwargs["split"]))
++        channels, count = wav.array.shape[-2], wav.array.shape[-1]
++        sources = np.zeros((4, channels, count), dtype="float32")
++        sources[3] = wav.array[0]
++        return [_Tensor(sources)]
++
++    torch = ModuleType("torch")
++    torch.load = lambda *args, **kwargs: {"loaded": True}
++    torch.from_numpy = lambda array: _Tensor(array)
++    torch.isfinite = lambda value: np.isfinite(value)
++    class _Inference:
++        def __enter__(self):
++            return None
++
++        def __exit__(self, *_args):
++            return False
++
++    torch.inference_mode = _Inference
++    demucs_apply = ModuleType("demucs.apply")
++    demucs_apply.apply_model = apply_model
++    demucs_states = ModuleType("demucs.states")
++    demucs_states.load_model = lambda package: model
++    monkeypatch.setitem(sys.modules, "torch", torch)
++    monkeypatch.setitem(sys.modules, "demucs", ModuleType("demucs"))
++    monkeypatch.setitem(sys.modules, "demucs.apply", demucs_apply)
++    monkeypatch.setitem(sys.modules, "demucs.states", demucs_states)
++    monkeypatch.setattr(hashlib, "file_digest", lambda *_args, **_kwargs: _Digest())
++    code = separate_process.main([
++        "--model-path", str(checkpoint), "--audio-path", str(audio),
++        "--vocals-path", str(vocals), "--background-path", str(background),
++        "--device", device,
++    ])
++    return code, events, vocals, background
++
++
++def test_demucs_places_cpu_model_on_cuda_before_apply(monkeypatch, tmp_path, capsys):
++    def move(model, requested):
++        for parameter in model.params:
++            parameter.device = requested
++
++    code, events, vocals, background = _demucs_child(monkeypatch, tmp_path, device="cuda:0", move=move)
++    assert code == 0
++    assert events[0] == ("to", "cuda:0")
++    assert events[1][0:3] == ("apply", "cuda:0", "cuda:0")
++    assert events[1][3:] == (1, 0.25, True)
++    assert vocals.is_file() and background.is_file()
++    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++    assert line["requested_device"] == "cuda:0" and line["tensor_devices"] == ["cuda:0"]
++
++
++def test_demucs_cuda_request_does_not_separate_when_placement_stays_on_cpu(monkeypatch, tmp_path, capsys):
++    code, events, vocals, background = _demucs_child(
++        monkeypatch, tmp_path, device="cuda:0", move=lambda model, requested: None,
++    )
++    assert code == 1
++    assert events == [("to", "cuda:0")]
++    assert not vocals.exists() and not background.exists()
++    error = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
++    assert error["code"] == "MODEL_NOT_READY"
++
++
+ def test_child_rejects_invalid_weight_before_importing_demucs(context, monkeypatch, capsys):
+     monkeypatch.setitem(sys.modules, "demucs", None)
+     args = []
 diff --git a/backend/tests/test_v1_tts.py b/backend/tests/test_v1_tts.py
-index a49c7cf..bcbdd11 100644
+index a49c7cf..5d63c34 100644
 --- a/backend/tests/test_v1_tts.py
 +++ b/backend/tests/test_v1_tts.py
-@@ -417,3 +417,196 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
+@@ -417,3 +417,231 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
      assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "INVALID_PROVIDER_RESULT"
      assert len(calls) == 1
      assert not any(Path(clip["output_path"]).exists() for clip in clips)
@@ -1384,6 +1806,41 @@ index a49c7cf..bcbdd11 100644
 +    assert tts_process.main(arguments) == 1
 +    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
 +    assert loaded[0]["device"] == "cuda:0" and loaded[1].placed == ["cuda:0"]
++    assert not generated
++    assert not any(Path(clip["output_path"]).exists() for clip in clips)
++
++
++def test_cuda_request_fails_when_a_buffer_stays_on_cpu(context, monkeypatch, capsys):
++    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
++    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
++    generated = []
++
++    class HalfMoved(_TTS):
++        def __init__(self):
++            super().__init__("cpu")
++            self.bufs = [_Parameter("cpu")]
++
++        def buffers(self):
++            return self.bufs
++
++        def to(self, device):
++            self.placed.append(device)
++            for parameter in self.params:
++                parameter.device = device
++            return self
++
++    def generate(**kwargs):
++        generated.append(kwargs)
++        return np.full(4800, 0.25)
++
++    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(
++        from_pretrained=lambda *args, **kwargs: SimpleNamespace(
++            tts_model=HalfMoved(), generate=generate,
++        ))))
++    clips, arguments = child_request(context)
++    arguments[arguments.index("--device") + 1] = "cuda:0"
++    assert tts_process.main(arguments) == 1
++    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
 +    assert not generated
 +    assert not any(Path(clip["output_path"]).exists() for clip in clips)
 +
@@ -1528,10 +1985,10 @@ index c445495..033e045 100644
          segments = []
          for clip in clips:
 diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
-index c3a6b1d..c54c66f 100644
+index c3a6b1d..7bb2189 100644
 --- a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
 +++ b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
-@@ -1,6 +1,6 @@
+@@ -1,16 +1,18 @@
  /**
   * The web app's command-line provider: it parses the `npm run dev:web --` flag
 - * family (`--host`, `--port`, `--public-url`, `--trusted-host`, `--no-open`, TLS)
@@ -1539,7 +1996,11 @@ index c3a6b1d..c54c66f 100644
   * and its `--help` text, then provides the immutable values as
   * {@link WEB_STARTUP_SERVICE}. Ordinary rows inject that service before
   * reading it from lazy config.
-@@ -11,6 +11,7 @@ import { Command } from 'commander'
+  * @module @deepseek-ai/dsh-web-app/startup
+  */
+ 
++import { isAbsolute } from 'node:path'
+ import { Command } from 'commander'
  import type { Context } from '@deepseek-ai/cordis'
  import { parseCmdline } from '@deepseek-ai/dsh-cmdline'
  import { isWildcardHost, type TlsConfig } from '@deepseek-ai/dsh-host-webserver'
@@ -1547,7 +2008,7 @@ index c3a6b1d..c54c66f 100644
  import { parsePublicUrl } from './public-url.ts'
  
  /** Stable Cordis plugin name. */
-@@ -35,6 +36,11 @@ export interface WebStartupValues {
+@@ -35,6 +37,16 @@ export interface WebStartupValues {
     * See [public deployments](../README.md#public-deployments).
     */
    publicUrl?: string
@@ -1556,10 +2017,15 @@ index c3a6b1d..c54c66f 100644
 +   * `--public-origin` nor `YOUDUB_PUBLIC_ORIGIN` is set.
 +   */
 +  publicOrigin?: string
++  /**
++   * Absolute `YOUDUB_LAUNCH_TOKEN_FILE`, absent when unset. The host reads or
++   * creates that mode-0600 file and does not log its contents.
++   */
++  launchTokenFile?: string
    /** Explicit `--trusted-host` authorities, in argument order. */
    trustedHosts: string[]
    /** Server certificate chain and unencrypted private key supplied together. */
-@@ -47,6 +53,7 @@ interface WebOptions {
+@@ -47,6 +59,7 @@ interface WebOptions {
    open: boolean
    port?: string
    publicUrl?: string
@@ -1567,7 +2033,7 @@ index c3a6b1d..c54c66f 100644
    trustedHost?: string[]
    tlsCert?: string
    tlsKey?: string
-@@ -65,6 +72,7 @@ function webCommand(): Command {
+@@ -65,6 +78,7 @@ function webCommand(): Command {
      .option('--no-open', 'do not open the Web UI in the default browser')
      .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
      .option('--public-url <url>', 'advertise this HTTP(S) root in the printed and opened URL; grants no trust')
@@ -1575,7 +2041,7 @@ index c3a6b1d..c54c66f 100644
      .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
      .option('--tls-cert <file>', 'PEM server certificate chain; requires --tls-key')
      .option('--tls-key <file>', 'unencrypted PEM private key; requires --tls-cert')
-@@ -76,6 +84,8 @@ Examples:
+@@ -76,6 +90,8 @@ Examples:
    npm run dev:web -- --host 10.0.0.7         bind one local interface address
    npm run dev:web -- --public-url https://app.example/ui/ --trusted-host app.example
                                               advertise a prefix-stripping HTTPS proxy entry and admit its authority
@@ -1584,7 +2050,7 @@ index c3a6b1d..c54c66f 100644
    npm run dev:web -- --tls-cert ./server-chain.pem --tls-key ./server-key.pem
                                               serve HTTPS with an existing certificate and key
  `)
-@@ -111,11 +121,23 @@ export function apply(ctx: Context): void {
+@@ -111,11 +127,28 @@ export function apply(ctx: Context): void {
          program.error(`error: ${(error as Error).message}`)
        }
      }
@@ -1599,6 +2065,10 @@ index c3a6b1d..c54c66f 100644
 +      program.error('error: --public-url origin must equal --public-origin / YOUDUB_PUBLIC_ORIGIN')
 +    }
 +    const publicUrl = options.publicUrl ?? (publicOrigin === undefined ? undefined : `${publicOrigin.origin}/`)
++    const launchTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE?.trim() || undefined
++    if (launchTokenFile !== undefined && !isAbsolute(launchTokenFile)) {
++      program.error('error: YOUDUB_LAUNCH_TOKEN_FILE must be an absolute path')
++    }
      ctx.provide(WEB_STARTUP_SERVICE, {
        openBrowser: options.open,
        ...options.host !== undefined && { host: options.host },
@@ -1606,11 +2076,12 @@ index c3a6b1d..c54c66f 100644
 -      ...options.publicUrl !== undefined && { publicUrl: options.publicUrl },
 +      ...publicUrl !== undefined && { publicUrl },
 +      ...publicOrigin !== undefined && { publicOrigin: publicOrigin.origin },
++      ...launchTokenFile !== undefined && { launchTokenFile },
        ...tls !== undefined && { tls },
        trustedHosts: options.trustedHost ?? [],
      } satisfies WebStartupValues)
 diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
-index 4aa8ed3..e6b23d3 100644
+index 4aa8ed3..785d1ec 100644
 --- a/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
 +++ b/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
 @@ -37,7 +37,7 @@ afterEach(async () => {
@@ -1618,15 +2089,16 @@ index 4aa8ed3..e6b23d3 100644
   * @returns the service value and observed consumer/process effects.
   */
 -async function bootProvider(args: string[]): Promise<{
-+async function bootProvider(args: string[], originEnv?: string): Promise<{
++async function bootProvider(args: string[], originEnv?: string, tokenFile?: string): Promise<{
    values: WebStartupValues | undefined
    observed: Observed
  }> {
-@@ -63,12 +63,20 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
+@@ -63,12 +63,26 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
      '    openBrowser: !!js ctx.webStartup.openBrowser',
      '    port: !!js ctx.webStartup.port ?? 3080',
      '    publicUrl: !!js ctx.webStartup.publicUrl',
 +    '    publicOrigin: !!js ctx.webStartup.publicOrigin',
++    '    launchTokenFile: !!js ctx.webStartup.launchTokenFile',
      '    trustedHosts: !!js ctx.webStartup.trustedHosts',
      '    tls: !!js ctx.webStartup.tls',
      '- id: provider',
@@ -1636,14 +2108,19 @@ index 4aa8ed3..e6b23d3 100644
 +  const savedOrigin = process.env.YOUDUB_PUBLIC_ORIGIN
 +  delete process.env.YOUDUB_PUBLIC_ORIGIN
 +  if (originEnv !== undefined) process.env.YOUDUB_PUBLIC_ORIGIN = originEnv
++  const savedTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE
++  delete process.env.YOUDUB_LAUNCH_TOKEN_FILE
++  if (tokenFile !== undefined) process.env.YOUDUB_LAUNCH_TOKEN_FILE = tokenFile
 +  disposers.push(async () => {
 +    if (savedOrigin === undefined) delete process.env.YOUDUB_PUBLIC_ORIGIN
 +    else process.env.YOUDUB_PUBLIC_ORIGIN = savedOrigin
++    if (savedTokenFile === undefined) delete process.env.YOUDUB_LAUNCH_TOKEN_FILE
++    else process.env.YOUDUB_LAUNCH_TOKEN_FILE = savedTokenFile
 +  })
    const observe = (chunk: string | Uint8Array): boolean => { observed.out += String(chunk); return true }
    vi.spyOn(process.stdout, 'write').mockImplementation(observe)
    vi.spyOn(process.stderr, 'write').mockImplementation(observe)
-@@ -140,6 +148,7 @@ describe('web command-line provider', () => {
+@@ -140,6 +154,7 @@ describe('web command-line provider', () => {
      expect(observed.out).toContain('npm run dev:web --')
      expect(observed.out).toContain('--no-open')
      expect(observed.out).toContain('--public-url')
@@ -1651,7 +2128,7 @@ index 4aa8ed3..e6b23d3 100644
      expect(observed.out).toContain('--trusted-host')
      expect(values).toBeUndefined()
      expect(observed.readerConfig).toBeUndefined()
-@@ -182,6 +191,41 @@ describe('web command-line provider', () => {
+@@ -182,6 +197,58 @@ describe('web command-line provider', () => {
      expect(observed.exits).toEqual([1])
    })
  
@@ -1666,6 +2143,23 @@ index 4aa8ed3..e6b23d3 100644
 +    })
 +    expect(observed.readerConfig).toMatchObject({ publicOrigin: origin, publicUrl: `${origin}/` })
 +    expect(observed.exits).toEqual([])
++  })
++
++  it('publishes an absolute launch-token path and does not echo a token', async () => {
++    const file = '/var/lib/youdub/launch-token'
++    const { values, observed } = await bootProvider(['--no-open'], undefined, file)
++    expect(values).toMatchObject({ launchTokenFile: file, openBrowser: false, trustedHosts: [] })
++    expect(observed.readerConfig).toMatchObject({ launchTokenFile: file })
++    expect(observed.out).not.toContain(file)
++    expect(observed.exits).toEqual([])
++  })
++
++  it('rejects a relative launch-token path before the consumer activates', async () => {
++    const { values, observed } = await bootProvider(['--no-open'], undefined, 'relative/launch-token')
++    expect(observed.out).toContain('YOUDUB_LAUNCH_TOKEN_FILE must be an absolute path')
++    expect(observed.out).not.toContain('relative/launch-token')
++    expect(values).toBeUndefined()
++    expect(observed.exits).toEqual([1])
 +  })
 +
 +  it('reads YOUDUB_PUBLIC_ORIGIN when --public-origin is omitted', async () => {
@@ -1694,10 +2188,105 @@ index 4aa8ed3..e6b23d3 100644
      // The parser's own suite owns the exhaustive spellings; the provider only
      // has to fail the invocation before any consumer activates.
 diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts b/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
-index caeafc3..378d448 100644
+index caeafc3..36e08d0 100644
 --- a/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
 +++ b/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
-@@ -254,10 +254,10 @@ export class BrowserAuth {
+@@ -1,6 +1,8 @@
+ /** Browser-session authentication for the Host Connection carrier. */
+ 
+ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
++import { chmodSync, closeSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs'
++import { isAbsolute } from 'node:path'
+ import type { PeerId } from '@deepseek-ai/dsh-typert-protocol'
+ import { CONNECT_PATH, type ConnectionInteractions } from './connect-protocol.ts'
+ import { credentialKey } from '@deepseek-ai/dsh-credentials'
+@@ -58,10 +60,52 @@ function decodeBase64Url(value: string): Buffer | undefined {
+   return encodeBase64Url(decoded) === value ? decoded : undefined
+ }
+ 
+-function processLaunchToken(owner: object): string {
++function readLaunchTokenFile(file: string): string {
++  const stat = lstatSync(file)
++  if (stat.isSymbolicLink() || !stat.isFile()) {
++    throw new Error('client-connection: launch token file must be a regular file')
++  }
++  const token = readFileSync(file, 'utf8').trim()
++  const decoded = decodeBase64Url(token)
++  if (decoded === undefined || decoded.length !== SECRET_BYTES) {
++    throw new Error('client-connection: launch token file is invalid')
++  }
++  chmodSync(file, 0o600)
++  return token
++}
++
++function persistentLaunchToken(file: string): string {
++  if (!isAbsolute(file)) {
++    throw new Error('client-connection: launch token file must be an absolute path')
++  }
++  try {
++    return readLaunchTokenFile(file)
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
++  }
++  const token = encodeBase64Url(randomBytes(SECRET_BYTES))
++  let fd: number
++  try {
++    fd = openSync(file, 'wx', 0o600)
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
++    return readLaunchTokenFile(file)
++  }
++  try {
++    writeSync(fd, `${token}\n`)
++  } finally {
++    closeSync(fd)
++  }
++  chmodSync(file, 0o600)
++  return token
++}
++
++function processLaunchToken(owner: object, file?: string): string {
+   const existing = PROCESS_LAUNCH_TOKENS.get(owner)
+   if (existing !== undefined) return existing
+-  const created = encodeBase64Url(randomBytes(SECRET_BYTES))
++  const created = file === undefined || file === ''
++    ? encodeBase64Url(randomBytes(SECRET_BYTES))
++    : persistentLaunchToken(file)
+   PROCESS_LAUNCH_TOKENS.set(owner, created)
+   return created
+ }
+@@ -211,8 +255,9 @@ export class BrowserAuth {
+     processOwner: object,
+     private readonly secret: Buffer,
+     maxAgeDays: number,
++    launchTokenFile?: string,
+   ) {
+-    this.launchToken = processLaunchToken(processOwner)
++    this.launchToken = processLaunchToken(processOwner, launchTokenFile)
+     this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
+     if (!Number.isSafeInteger(this.maxAgeMilliseconds)
+       || !Number.isSafeInteger(Date.now() + this.maxAgeMilliseconds)) {
+@@ -226,14 +271,18 @@ export class BrowserAuth {
+    * @param processOwner - root application context retaining one token across Connection reloads.
+    * @param credentials - persistent credential provider for the Web profile.
+    * @param maxAgeDays - positive absolute browser-cookie lifetime in days.
++   * @param launchTokenFile - absolute path of an optional mode-0600 token file.
++   *   When set, the same `?token=` value is reused across process starts. The
++   *   file contents are not written to a log. Omit it to keep a process-local token.
+    * @returns initialized authentication owner with the process owner's launch token.
+    */
+   static async create(
+     processOwner: object,
+     credentials: CredentialProvider,
+     maxAgeDays: number,
++    launchTokenFile?: string,
+   ): Promise<BrowserAuth> {
+-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
++    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays, launchTokenFile)
+   }
+ 
+   /**
+@@ -254,10 +303,10 @@ export class BrowserAuth {
     * 401 response.
     * @param req - incoming root or configured-index request.
     * @param res - response owned when this method returns false.
@@ -1713,10 +2302,18 @@ index caeafc3..378d448 100644
     */
    authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse, secure = false): boolean {
 diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/index.ts b/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
-index 4b8c1e3..59fdf50 100644
+index 4b8c1e3..8294801 100644
 --- a/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
 +++ b/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
-@@ -10,6 +10,7 @@ import { CONNECT_PATH } from './connect-protocol.ts'
+@@ -1,6 +1,7 @@
+ /** Host HTTP bridge for browser-client RPC. */
+ import type { Context } from '@deepseek-ai/cordis'
+ import type { IncomingMessage, ServerResponse } from 'node:http'
++import { isAbsolute } from 'node:path'
+ import z from '@deepseek-ai/schemastery'
+ import type {} from '@deepseek-ai/dsh-credentials'
+ // Activates the webServer Context merge used below.
+@@ -10,6 +11,7 @@ import { CONNECT_PATH } from './connect-protocol.ts'
  import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
  import { assertTrustedAuthority } from './api-request-trust.ts'
  import { BrowserAuth } from './browser-auth.ts'
@@ -1724,7 +2321,7 @@ index 4b8c1e3..59fdf50 100644
  import { HostConnectionService } from './rpc-host.ts'
  import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
  
-@@ -52,6 +53,7 @@ export {
+@@ -52,6 +54,7 @@ export {
  export { HostConnectionService } from './rpc-host.ts'
  
  export { API_PATH } from './api-path.ts'
@@ -1732,7 +2329,7 @@ index 4b8c1e3..59fdf50 100644
  
  /** Stable Cordis plugin name. */
  export const name = 'client-connection'
-@@ -84,6 +86,13 @@ export interface ConnectionConfig {
+@@ -84,6 +87,20 @@ export interface ConnectionConfig {
     * an entry here. A non-canonical or non-bare authority fails plugin load.
     */
    trustedHosts?: string[]
@@ -1743,18 +2340,26 @@ index 4b8c1e3..59fdf50 100644
 +   * it. Any other forwarded value is ignored. A wildcard is rejected.
 +   */
 +  publicOrigin?: string
++  /**
++   * Absolute path of a mode-0600 file holding the launch token. When set, a
++   * supervisor restart keeps the same `?token=` URL. The cookie signing secret
++   * stays in the credential store. The token is not logged. Absent means a
++   * new process-local token, which is the historical behavior.
++   */
++  launchTokenFile?: string
    /** Absolute browser and API cookie lifetime in days. Default: 30. */
    cookieMaxAgeDays?: number
    /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
-@@ -93,6 +102,7 @@ export interface ConnectionConfig {
+@@ -93,6 +110,8 @@ export interface ConnectionConfig {
  export const Config: z<ConnectionConfig> = z.object({
    recovery: ConnectionRecoveryConfigSchema.default({}),
    trustedHosts: z.array(String).default([]),
 +  publicOrigin: z.string(),
++  launchTokenFile: z.string(),
    cookieMaxAgeDays: z.natural().min(1).default(30),
    maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
  })
-@@ -113,11 +123,14 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
+@@ -113,11 +132,20 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
    // Config boundary: a malformed entry fails the load loudly here rather than
    // silently authorizing its hostname prefix at request time.
    for (const entry of trustedHosts) assertTrustedAuthority(entry)
@@ -1767,7 +2372,13 @@ index 4b8c1e3..59fdf50 100644
 +  const publicOrigin = typeof rawOrigin === 'string' && rawOrigin !== ''
 +    ? parsePublicOrigin(rawOrigin, 'publicOrigin')
 +    : undefined
-+  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays)
++  const configuredTokenFile = config?.launchTokenFile?.trim()
++  const envTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE?.trim()
++  const launchTokenFile = configuredTokenFile || envTokenFile || undefined
++  if (launchTokenFile !== undefined && !isAbsolute(launchTokenFile)) {
++    throw new Error('client-connection: launch token file must be an absolute path')
++  }
++  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays, launchTokenFile)
 +  const connection = publicOrigin === undefined
 +    ? new HostConnectionService(ctx, trustedHosts, browserAuth)
 +    : new HostConnectionService(ctx, trustedHosts, browserAuth, publicOrigin)

@@ -15,6 +15,20 @@ from ..paths import data_directory
 MODEL_FILES = {"htdemucs": "955717e8-8726e21a.th"}
 
 
+def finished_message(stdout: str) -> str:
+    for line in reversed(stdout.splitlines()):
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if payload.get("event") != "device":
+            continue
+        devices = payload.get("tensor_devices")
+        if isinstance(devices, list) and devices and all(isinstance(item, str) and item for item in devices):
+            return f"Demucs tensors on {', '.join(devices)}"
+    return "Vocals and background are ready"
+
+
 def model_directory() -> Path:
     configured = os.getenv("YOUDUB_DEMUCS_MODELS_DIR", "").strip()
     return Path(configured).expanduser().resolve() if configured else data_directory() / "models" / "demucs"
@@ -75,5 +89,5 @@ def run(context: StageContext, progress) -> Completed:
                 raise ValueError("Separated audio changed its source timeline or format")
     except (OSError, RuntimeError, ValueError) as exc:
         raise ApiError(502, "INVALID_PROVIDER_RESULT", "Separated audio is missing or has invalid timing.", stage="separate") from exc
-    progress(1.0, "Vocals and background are ready")
+    progress(1.0, finished_message(result.stdout))
     return Completed(output_files={"vocals": vocals, "background": background})

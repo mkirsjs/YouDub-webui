@@ -37,7 +37,7 @@ afterEach(async () => {
  * @param args - the invocation's inner arguments.
  * @returns the service value and observed consumer/process effects.
  */
-async function bootProvider(args: string[], originEnv?: string): Promise<{
+async function bootProvider(args: string[], originEnv?: string, tokenFile?: string): Promise<{
   values: WebStartupValues | undefined
   observed: Observed
 }> {
@@ -64,6 +64,7 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
     '    port: !!js ctx.webStartup.port ?? 3080',
     '    publicUrl: !!js ctx.webStartup.publicUrl',
     '    publicOrigin: !!js ctx.webStartup.publicOrigin',
+    '    launchTokenFile: !!js ctx.webStartup.launchTokenFile',
     '    trustedHosts: !!js ctx.webStartup.trustedHosts',
     '    tls: !!js ctx.webStartup.tls',
     '- id: provider',
@@ -73,9 +74,14 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
   const savedOrigin = process.env.YOUDUB_PUBLIC_ORIGIN
   delete process.env.YOUDUB_PUBLIC_ORIGIN
   if (originEnv !== undefined) process.env.YOUDUB_PUBLIC_ORIGIN = originEnv
+  const savedTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE
+  delete process.env.YOUDUB_LAUNCH_TOKEN_FILE
+  if (tokenFile !== undefined) process.env.YOUDUB_LAUNCH_TOKEN_FILE = tokenFile
   disposers.push(async () => {
     if (savedOrigin === undefined) delete process.env.YOUDUB_PUBLIC_ORIGIN
     else process.env.YOUDUB_PUBLIC_ORIGIN = savedOrigin
+    if (savedTokenFile === undefined) delete process.env.YOUDUB_LAUNCH_TOKEN_FILE
+    else process.env.YOUDUB_LAUNCH_TOKEN_FILE = savedTokenFile
   })
   const observe = (chunk: string | Uint8Array): boolean => { observed.out += String(chunk); return true }
   vi.spyOn(process.stdout, 'write').mockImplementation(observe)
@@ -202,6 +208,23 @@ describe('web command-line provider', () => {
     })
     expect(observed.readerConfig).toMatchObject({ publicOrigin: origin, publicUrl: `${origin}/` })
     expect(observed.exits).toEqual([])
+  })
+
+  it('publishes an absolute launch-token path and does not echo a token', async () => {
+    const file = '/var/lib/youdub/launch-token'
+    const { values, observed } = await bootProvider(['--no-open'], undefined, file)
+    expect(values).toMatchObject({ launchTokenFile: file, openBrowser: false, trustedHosts: [] })
+    expect(observed.readerConfig).toMatchObject({ launchTokenFile: file })
+    expect(observed.out).not.toContain(file)
+    expect(observed.exits).toEqual([])
+  })
+
+  it('rejects a relative launch-token path before the consumer activates', async () => {
+    const { values, observed } = await bootProvider(['--no-open'], undefined, 'relative/launch-token')
+    expect(observed.out).toContain('YOUDUB_LAUNCH_TOKEN_FILE must be an absolute path')
+    expect(observed.out).not.toContain('relative/launch-token')
+    expect(values).toBeUndefined()
+    expect(observed.exits).toEqual([1])
   })
 
   it('reads YOUDUB_PUBLIC_ORIGIN when --public-origin is omitted', async () => {

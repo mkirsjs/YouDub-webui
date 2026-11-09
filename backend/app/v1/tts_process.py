@@ -223,17 +223,19 @@ def _adopt_prior(clip: dict, ordinal: int, model_path: Path, device: str, task_r
 
 
 def _tensor_devices(model) -> list[str]:
-    parameters = getattr(getattr(model, "tts_model", None), "parameters", None)
-    if not callable(parameters):
-        return []
+    tts = getattr(model, "tts_model", None)
     found = []
-    for parameter in parameters():
-        device = getattr(parameter, "device", None)
-        if device is None:
+    for method in ("parameters", "buffers"):
+        values = getattr(tts, method, None)
+        if not callable(values):
             continue
-        text = str(device)
-        if text not in found:
-            found.append(text)
+        for tensor in values():
+            device = getattr(tensor, "device", None)
+            if device is None:
+                continue
+            text = str(device)
+            if text not in found:
+                found.append(text)
     return found
 
 

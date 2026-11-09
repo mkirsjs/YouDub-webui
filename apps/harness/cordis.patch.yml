@@ -71,6 +71,7 @@
       config:
         trustedHosts: !!js ctx.webStartup.trustedHosts
         publicOrigin: !!js ctx.webStartup.publicOrigin
+        launchTokenFile: !!js ctx.webStartup.launchTokenFile
     - id: api-remotes
       name: '@deepseek-ai/dsh-api-remotes'
     - id: ui-theme

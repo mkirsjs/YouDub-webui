@@ -71,6 +71,9 @@ def test_srt_splits_display_only_preserves_inputs_and_joins_translation_by_id(mo
     assert "-shortest" not in command
     assert options["cwd"] == (context.work_dir / "output").resolve()
     assert "filename=translated.srt" in command[command.index("-vf") + 1]
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert "h264_nvenc" not in command and "-hwaccel" not in command
+    assert export.video_encoder_args() == ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"]
     assert all(path.parent == context.work_dir / "output" for path in result.output_files.values())
 
 

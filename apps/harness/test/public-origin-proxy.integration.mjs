@@ -5,7 +5,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { createServer, request as httpRequest } from 'node:http'
 import { registerHooks } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -306,9 +308,11 @@ test('host wiring keeps the origin check and publishes the exact origin', async 
   const startup = await readFile(join(sourceRoot, 'packages/bundle/web-app/src/startup.ts'), 'utf8')
   assert.match(startup, /--public-origin/)
   assert.match(startup, /YOUDUB_PUBLIC_ORIGIN/)
+  assert.match(startup, /YOUDUB_LAUNCH_TOKEN_FILE/)
   assert.match(startup, /selectConfiguredPublicOrigin/)
   const patch = await readFile(join(here, '../cordis.patch.yml'), 'utf8')
   assert.match(patch, /publicOrigin: !!js ctx\.webStartup\.publicOrigin/)
+  assert.match(patch, /launchTokenFile: !!js ctx\.webStartup\.launchTokenFile/)
 })
 
 test('authenticated external origin reaches API and WebSocket; bad token, foreign origin, and localhost stay distinct', { timeout: 10_000 }, async () => {
@@ -486,6 +490,70 @@ test('authenticated external origin reaches API and WebSocket; bad token, foreig
     assert.equal(operatorSocket.payload, 'ready')
   } finally {
     await host.close()
+  }
+})
+
+test('a mode 0600 launch-token file keeps the same URL token across process owners', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'youdub-launch-token-'))
+  const file = join(directory, 'launch-token')
+  try {
+    const first = await BrowserAuth.create({ owner: 'boot-1' }, memoryCredentials(), 30, file)
+    const mode = lstatSync(file).mode & 0o777
+    assert.equal(mode, 0o600)
+    const saved = readFileSync(file, 'utf8').trim()
+    const firstUrl = new URL(first.authenticatedUrl(`${PUBLIC_ORIGIN}/`))
+    assert.equal(firstUrl.origin, PUBLIC_ORIGIN)
+    assert.equal(firstUrl.searchParams.get('token'), saved)
+
+    chmodSync(file, 0o644)
+    const second = await BrowserAuth.create({ owner: 'boot-2' }, memoryCredentials(), 30, file)
+    assert.equal(lstatSync(file).mode & 0o777, 0o600)
+    const secondUrl = new URL(second.authenticatedUrl(`${PUBLIC_ORIGIN}/`))
+    assert.equal(secondUrl.origin, PUBLIC_ORIGIN)
+    assert.equal(secondUrl.searchParams.get('token'), saved)
+
+    const accepted = []
+    const granted = second.authorizeIndex({
+      method: 'GET',
+      url: `/?token=${saved}`,
+      headers: { host: `127.0.0.1:3086` },
+    }, {
+      writeHead(status, headers) { accepted.push({ status, headers }) },
+      end() {},
+    }, false)
+    assert.equal(granted, false)
+    assert.equal(accepted[0].status, 303)
+    assert.match(accepted[0].headers['set-cookie'], /HttpOnly/)
+
+    const rejected = []
+    second.authorizeIndex({
+      method: 'GET',
+      url: '/?token=different-token',
+      headers: { host: `127.0.0.1:3086` },
+    }, {
+      writeHead(status) { rejected.push(status) },
+      end() {},
+    }, false)
+    assert.equal(rejected[0], 401)
+
+    const link = join(directory, 'linked-token')
+    symlinkSync(file, link)
+    await assert.rejects(
+      () => BrowserAuth.create({ owner: 'boot-3' }, memoryCredentials(), 30, link),
+      /regular file/,
+    )
+    await assert.rejects(
+      () => BrowserAuth.create({ owner: 'boot-4' }, memoryCredentials(), 30, 'launch-token'),
+      /absolute path/,
+    )
+    writeFileSync(file, 'not-a-token\n', { mode: 0o600 })
+    await assert.rejects(
+      () => BrowserAuth.create({ owner: 'boot-5' }, memoryCredentials(), 30, file),
+      /invalid/,
+    )
+    assert.equal(readFileSync(file, 'utf8'), 'not-a-token\n')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
   }
 })
 

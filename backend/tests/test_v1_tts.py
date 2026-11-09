@@ -484,6 +484,41 @@ def test_cuda_request_fails_closed_when_parameters_stay_on_cpu(context, monkeypa
     assert not any(Path(clip["output_path"]).exists() for clip in clips)
 
 
+def test_cuda_request_fails_when_a_buffer_stays_on_cpu(context, monkeypatch, capsys):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated = []
+
+    class HalfMoved(_TTS):
+        def __init__(self):
+            super().__init__("cpu")
+            self.bufs = [_Parameter("cpu")]
+
+        def buffers(self):
+            return self.bufs
+
+        def to(self, device):
+            self.placed.append(device)
+            for parameter in self.params:
+                parameter.device = device
+            return self
+
+    def generate(**kwargs):
+        generated.append(kwargs)
+        return np.full(4800, 0.25)
+
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(
+        from_pretrained=lambda *args, **kwargs: SimpleNamespace(
+            tts_model=HalfMoved(), generate=generate,
+        ))))
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 1
+    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
+    assert not generated
+    assert not any(Path(clip["output_path"]).exists() for clip in clips)
+
+
 def test_cuda_placement_moves_cpu_parameters_before_generate(context, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")

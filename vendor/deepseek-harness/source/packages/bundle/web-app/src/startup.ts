@@ -7,6 +7,7 @@
  * @module @deepseek-ai/dsh-web-app/startup
  */
 
+import { isAbsolute } from 'node:path'
 import { Command } from 'commander'
 import type { Context } from '@deepseek-ai/cordis'
 import { parseCmdline } from '@deepseek-ai/dsh-cmdline'
@@ -41,6 +42,11 @@ export interface WebStartupValues {
    * `--public-origin` nor `YOUDUB_PUBLIC_ORIGIN` is set.
    */
   publicOrigin?: string
+  /**
+   * Absolute `YOUDUB_LAUNCH_TOKEN_FILE`, absent when unset. The host reads or
+   * creates that mode-0600 file and does not log its contents.
+   */
+  launchTokenFile?: string
   /** Explicit `--trusted-host` authorities, in argument order. */
   trustedHosts: string[]
   /** Server certificate chain and unencrypted private key supplied together. */
@@ -132,12 +138,17 @@ export function apply(ctx: Context): void {
       program.error('error: --public-url origin must equal --public-origin / YOUDUB_PUBLIC_ORIGIN')
     }
     const publicUrl = options.publicUrl ?? (publicOrigin === undefined ? undefined : `${publicOrigin.origin}/`)
+    const launchTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE?.trim() || undefined
+    if (launchTokenFile !== undefined && !isAbsolute(launchTokenFile)) {
+      program.error('error: YOUDUB_LAUNCH_TOKEN_FILE must be an absolute path')
+    }
     ctx.provide(WEB_STARTUP_SERVICE, {
       openBrowser: options.open,
       ...options.host !== undefined && { host: options.host },
       ...options.port !== undefined && { port: Number(options.port) },
       ...publicUrl !== undefined && { publicUrl },
       ...publicOrigin !== undefined && { publicOrigin: publicOrigin.origin },
+      ...launchTokenFile !== undefined && { launchTokenFile },
       ...tls !== undefined && { tls },
       trustedHosts: options.trustedHost ?? [],
     } satisfies WebStartupValues)

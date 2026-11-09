@@ -1,6 +1,7 @@
 /** Host HTTP bridge for browser-client RPC. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isAbsolute } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-credentials'
 // Activates the webServer Context merge used below.
@@ -93,6 +94,13 @@ export interface ConnectionConfig {
    * it. Any other forwarded value is ignored. A wildcard is rejected.
    */
   publicOrigin?: string
+  /**
+   * Absolute path of a mode-0600 file holding the launch token. When set, a
+   * supervisor restart keeps the same `?token=` URL. The cookie signing secret
+   * stays in the credential store. The token is not logged. Absent means a
+   * new process-local token, which is the historical behavior.
+   */
+  launchTokenFile?: string
   /** Absolute browser and API cookie lifetime in days. Default: 30. */
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
@@ -103,6 +111,7 @@ export const Config: z<ConnectionConfig> = z.object({
   recovery: ConnectionRecoveryConfigSchema.default({}),
   trustedHosts: z.array(String).default([]),
   publicOrigin: z.string(),
+  launchTokenFile: z.string(),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
 })
@@ -127,7 +136,13 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const publicOrigin = typeof rawOrigin === 'string' && rawOrigin !== ''
     ? parsePublicOrigin(rawOrigin, 'publicOrigin')
     : undefined
-  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays)
+  const configuredTokenFile = config?.launchTokenFile?.trim()
+  const envTokenFile = process.env.YOUDUB_LAUNCH_TOKEN_FILE?.trim()
+  const launchTokenFile = configuredTokenFile || envTokenFile || undefined
+  if (launchTokenFile !== undefined && !isAbsolute(launchTokenFile)) {
+    throw new Error('client-connection: launch token file must be an absolute path')
+  }
+  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays, launchTokenFile)
   const connection = publicOrigin === undefined
     ? new HostConnectionService(ctx, trustedHosts, browserAuth)
     : new HostConnectionService(ctx, trustedHosts, browserAuth, publicOrigin)
