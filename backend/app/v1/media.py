@@ -20,7 +20,7 @@ def _invalid(message: str) -> ApiError:
 
 def _run_media(
     command: list[str], *, check_cancel: Callable[[], None],
-    cwd: Path | None = None,
+    cwd: Path | None = None, poll: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Poll cancellation while draining process output, and always reap it."""
     check_cancel()
@@ -28,11 +28,15 @@ def _run_media(
         try:
             while True:
                 check_cancel()
+                if poll is not None:
+                    poll()
                 try:
                     stdout, stderr = process.communicate(timeout=0.1)
                     break
                 except subprocess.TimeoutExpired:
                     continue
+            if poll is not None:
+                poll()
             check_cancel()
         except BaseException:
             if process.poll() is None:

@@ -81,7 +81,7 @@ def prepare_reference_audio(context: StageContext, transcript: Transcript, progr
 
 
 def run(context: StageContext, progress: Callable[[float | None, str], None], *,
-        prepared_references: dict) -> Completed:
+        prepared_references: dict, task_root: Path | None = None) -> Completed:
     from .media import _run_media
 
     context.check_cancel()
@@ -119,13 +119,29 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
              for index, segment in enumerate(transcript.segments, start=1)]
     request_path = output_dir / "request.json"
     request_path.write_text(json.dumps({"clips": clips}, ensure_ascii=False, indent=2), encoding="utf-8")
+    progress_path = output_dir / "progress.json"
+    seen = {"message": None}
+
+    def poll() -> None:
+        try:
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return
+        message = payload.get("message")
+        if not isinstance(message, str) or not message or message == seen["message"]:
+            return
+        seen["message"] = message
+        index, total = payload.get("index"), payload.get("total")
+        value = index / total if isinstance(index, int) and isinstance(total, int) and total > 0 and index >= 0 else None
+        progress(value, message)
+
+    command = [sys.executable, str(Path(__file__).with_name("tts_process.py")),
+               "--model-path", str(model_directory().resolve()), "--request-path", str(request_path.resolve()),
+               "--device", selection.device]
+    if task_root is not None:
+        command.extend(["--task-root", str(task_root.resolve())])
     progress(None, "Generating translated speech with VoxCPM2")
-    result = _run_media(
-        [sys.executable, str(Path(__file__).with_name("tts_process.py")),
-         "--model-path", str(model_directory().resolve()), "--request-path", str(request_path.resolve()),
-         "--device", selection.device],
-        check_cancel=context.check_cancel,
-    )
+    result = _run_media(command, check_cancel=context.check_cancel, poll=poll)
     if result.returncode != 0:
         try:
             error = json.loads(result.stderr.strip().splitlines()[-1])

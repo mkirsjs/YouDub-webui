@@ -174,7 +174,7 @@ class Operation:
             if not isinstance(text, str) or not text.strip():
                 raise WorkerError("INVALID_INPUT", f"Reference transcript is missing for segment {segment_id}.")
             prepared[segment_id] = {"path": self.path(ref.get("audio")), "text": text}
-        result = tts.run(context, self.wire.progress, prepared_references=prepared)
+        result = tts.run(context, self.wire.progress, prepared_references=prepared, task_root=self.root)
         clips = json.loads(result.output_files["speech_clips"].read_text())["clips"]
         segments = []
         for clip in clips:
