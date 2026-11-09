@@ -12,6 +12,7 @@ import {
 import { clientRequestSchema } from './rpc-schema.ts'
 import { bridge } from './http-bridge.ts'
 import { isTrustedApiRequest } from './api-request-trust.ts'
+import { requestTrustView, type PublicOrigin, type RequestTrustView } from './public-origin.ts'
 import { API_PATH } from './api-path.ts'
 import type { BrowserAuth } from './browser-auth.ts'
 import { Peer } from './peer.ts'
@@ -85,6 +86,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    private readonly publicOrigin?: PublicOrigin,
   ) {
     super(ctx, 'connection')
     this.owner = ctx
@@ -117,11 +119,12 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   /** Browser requests share an owner Peer; API HTTP does not depend on an attached socket. */
   admit(request: ConnectionTrustRequest): PeerAdmission {
-    if (!this.isTrusted(request)) return { rejection: 403 }
+    const view = this.trustContext(request)
+    if (!this.viewIsTrusted(view)) return { rejection: 403 }
     if (this.disposed) return { rejection: 401 }
-    const secure = this.owner.get('webServer')?.protocol === 'https:'
-    if (this.browserAuth.isAuthenticated(request, secure)) return { peer: this.browserPeer }
-    const id = this.browserAuth.authenticateApi(request, secure)
+    const seen = { headers: view.headers }
+    if (this.browserAuth.isAuthenticated(seen, view.secure)) return { peer: this.browserPeer }
+    const id = this.browserAuth.authenticateApi(seen, view.secure)
     const record = id === undefined ? undefined : this.peers.get(id)
     return record === undefined ? { rejection: 401 } : { peer: record.peer }
   }
@@ -146,9 +149,22 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
-  private isTrusted(request: ConnectionTrustRequest): boolean {
+  /**
+   * Host, scheme, and cookie audience for one request. A configured public
+   * origin replaces the loopback Host only when the proxy headers match it.
+   */
+  private trustContext(request: ConnectionTrustRequest): RequestTrustView {
     const carrier = this.owner.get('webServer')
-    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
+    return requestTrustView(request, {
+      ...this.publicOrigin !== undefined ? { publicOrigin: this.publicOrigin } : {},
+      trustedHosts: this.trustedHosts,
+      listenerProtocol: carrier?.protocol ?? 'http:',
+    })
+  }
+
+  private viewIsTrusted(view: RequestTrustView): boolean {
+    const carrier = this.owner.get('webServer')
+    return isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, carrier?.host, view.protocol)
   }
 
   private publishPeer(interactions: ConnectionInteractions): PeerId {
@@ -163,20 +179,30 @@ export class HostConnectionService extends Service implements HostConnectionHand
    * @param response - response owned to completion.
    */
   authorizeConnect(request: ConnectionIndexRequest, response: ConnectionIndexResponse): void {
-    if (!this.isTrusted(request) || this.disposed) {
+    const view = this.trustContext(request)
+    if (!this.viewIsTrusted(view) || this.disposed) {
       response.writeHead(this.disposed ? 401 : 403)
       response.end(this.disposed ? 'unauthorized' : 'forbidden')
       return
     }
-    this.browserAuth.authorizeConnect(request, response,
-      this.owner.get('webServer')?.protocol === 'https:', interactions => this.publishPeer(interactions))
+    this.browserAuth.authorizeConnect({
+      method: request.method,
+      url: request.url,
+      headers: view.headers,
+    }, response, view.secure, interactions => this.publishPeer(interactions))
   }
 
   /**
-   * Authenticate an index request; native TLS listeners mint Secure cookies.
+   * Authenticate an index request. Secure cookies follow the listener, or the
+   * configured public HTTPS origin when this request's proxy headers match it.
    */
   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean {
-    return this.browserAuth.authorizeIndex(request, response, this.ctx.get('webServer')?.protocol === 'https:')
+    const view = this.trustContext(request)
+    return this.browserAuth.authorizeIndex({
+      method: request.method,
+      url: request.url,
+      headers: view.headers,
+    }, response, view.secure)
   }
 
   /** Add this process's launch token to the clean application URL. */

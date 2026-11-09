@@ -33,6 +33,7 @@
     "desktop": "node desktop.mjs",
     "pretest": "node -e \"require('electron')\" && node build-framework.mjs --verify-only",
     "test": "node --import ./test/source-framework.mjs --test test/*.test.mjs",
+    "test:public-origin": "node --import tsx --test test/public-origin-proxy.integration.mjs",
     "check:composition": "node check-composition.mjs",
     "check:framework": "node framework-source.mjs",
     "build:desktop": "node build-desktop.mjs",

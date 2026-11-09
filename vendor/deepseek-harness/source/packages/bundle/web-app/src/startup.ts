@@ -1,6 +1,6 @@
 /**
  * The web app's command-line provider: it parses the `npm run dev:web --` flag
- * family (`--host`, `--port`, `--public-url`, `--trusted-host`, `--no-open`, TLS)
+ * family (`--host`, `--port`, `--public-url`, `--public-origin`, `--trusted-host`, `--no-open`, TLS)
  * and its `--help` text, then provides the immutable values as
  * {@link WEB_STARTUP_SERVICE}. Ordinary rows inject that service before
  * reading it from lazy config.
@@ -11,6 +11,7 @@ import { Command } from 'commander'
 import type { Context } from '@deepseek-ai/cordis'
 import { parseCmdline } from '@deepseek-ai/dsh-cmdline'
 import { isWildcardHost, type TlsConfig } from '@deepseek-ai/dsh-host-webserver'
+import { publicUrlMatchesOrigin, selectConfiguredPublicOrigin } from '@deepseek-ai/dsh-client-connection'
 import { parsePublicUrl } from './public-url.ts'
 
 /** Stable Cordis plugin name. */
@@ -35,6 +36,11 @@ export interface WebStartupValues {
    * See [public deployments](../README.md#public-deployments).
    */
   publicUrl?: string
+  /**
+   * Exact public origin admitted from a loopback proxy, absent when neither
+   * `--public-origin` nor `YOUDUB_PUBLIC_ORIGIN` is set.
+   */
+  publicOrigin?: string
   /** Explicit `--trusted-host` authorities, in argument order. */
   trustedHosts: string[]
   /** Server certificate chain and unencrypted private key supplied together. */
@@ -47,6 +53,7 @@ interface WebOptions {
   open: boolean
   port?: string
   publicUrl?: string
+  publicOrigin?: string
   trustedHost?: string[]
   tlsCert?: string
   tlsKey?: string
@@ -65,6 +72,7 @@ function webCommand(): Command {
     .option('--no-open', 'do not open the Web UI in the default browser')
     .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
     .option('--public-url <url>', 'advertise this HTTP(S) root in the printed and opened URL; grants no trust')
+    .option('--public-origin <origin>', 'exact public http(s)://host[:port] of a loopback TLS-terminating proxy; also read from YOUDUB_PUBLIC_ORIGIN')
     .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
     .option('--tls-cert <file>', 'PEM server certificate chain; requires --tls-key')
     .option('--tls-key <file>', 'unencrypted PEM private key; requires --tls-cert')
@@ -76,6 +84,8 @@ Examples:
   npm run dev:web -- --host 10.0.0.7         bind one local interface address
   npm run dev:web -- --public-url https://app.example/ui/ --trusted-host app.example
                                              advertise a prefix-stripping HTTPS proxy entry and admit its authority
+  npm run dev:web -- --public-origin https://app.example
+                                             trust one exact HTTPS origin from loopback X-Forwarded-Host/Proto and advertise it
   npm run dev:web -- --tls-cert ./server-chain.pem --tls-key ./server-key.pem
                                              serve HTTPS with an existing certificate and key
 `)
@@ -111,11 +121,23 @@ export function apply(ctx: Context): void {
         program.error(`error: ${(error as Error).message}`)
       }
     }
+    let publicOrigin: ReturnType<typeof selectConfiguredPublicOrigin>
+    try {
+      publicOrigin = selectConfiguredPublicOrigin(options.publicOrigin, process.env.YOUDUB_PUBLIC_ORIGIN)
+    } catch (error) {
+      program.error(`error: ${(error as Error).message}`)
+    }
+    if (publicOrigin !== undefined && options.publicUrl !== undefined
+      && !publicUrlMatchesOrigin(options.publicUrl, publicOrigin)) {
+      program.error('error: --public-url origin must equal --public-origin / YOUDUB_PUBLIC_ORIGIN')
+    }
+    const publicUrl = options.publicUrl ?? (publicOrigin === undefined ? undefined : `${publicOrigin.origin}/`)
     ctx.provide(WEB_STARTUP_SERVICE, {
       openBrowser: options.open,
       ...options.host !== undefined && { host: options.host },
       ...options.port !== undefined && { port: Number(options.port) },
-      ...options.publicUrl !== undefined && { publicUrl: options.publicUrl },
+      ...publicUrl !== undefined && { publicUrl },
+      ...publicOrigin !== undefined && { publicOrigin: publicOrigin.origin },
       ...tls !== undefined && { tls },
       trustedHosts: options.trustedHost ?? [],
     } satisfies WebStartupValues)

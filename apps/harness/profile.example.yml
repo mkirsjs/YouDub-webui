@@ -9,3 +9,7 @@
   config:
     host: 127.0.0.1
     port: 3086
+# External HTTPS is not a profile wildcard. Set one exact origin on the host
+# process, then point nginx at 127.0.0.1:3086 with that host and proto:
+#   YOUDUB_PUBLIC_ORIGIN=https://7860-example.pod.compshare.cn
+#   or --public-origin https://7860-example.pod.compshare.cn

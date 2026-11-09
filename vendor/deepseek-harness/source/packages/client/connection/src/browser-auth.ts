@@ -254,10 +254,10 @@ export class BrowserAuth {
    * 401 response.
    * @param req - incoming root or configured-index request.
    * @param res - response owned when this method returns false.
-   * @param secure - whether the listener receiving this request serves TLS; the
-   * minted cookie carries `Secure` when it does. Only that listener's own
-   * protocol decides, never a `publicUrl` announcement or a forwarded header:
-   * those describe a hop this process does not terminate.
+   * @param secure - whether the minted cookie carries `Secure`. The caller
+   * passes true for a TLS listener, or for one request whose forwarded
+   * identity exactly matches the configured public HTTPS origin. This method
+   * does not read `publicUrl` or forwarded headers itself.
    * @returns true only when the caller may serve index.html.
    */
   authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse, secure = false): boolean {

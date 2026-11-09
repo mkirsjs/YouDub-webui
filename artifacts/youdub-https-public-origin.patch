@@ -1,0 +1,1205 @@
+diff --git a/apps/harness/cordis.patch.yml b/apps/harness/cordis.patch.yml
+index 0e64d9a..4540a77 100644
+--- a/apps/harness/cordis.patch.yml
++++ b/apps/harness/cordis.patch.yml
+@@ -70,6 +70,7 @@
+         - webStartup
+       config:
+         trustedHosts: !!js ctx.webStartup.trustedHosts
++        publicOrigin: !!js ctx.webStartup.publicOrigin
+     - id: api-remotes
+       name: '@deepseek-ai/dsh-api-remotes'
+     - id: ui-theme
+diff --git a/apps/harness/package.json b/apps/harness/package.json
+index 382dea7..3cc16fb 100644
+--- a/apps/harness/package.json
++++ b/apps/harness/package.json
+@@ -33,6 +33,7 @@
+     "desktop": "node desktop.mjs",
+     "pretest": "node -e \"require('electron')\" && node build-framework.mjs --verify-only",
+     "test": "node --import ./test/source-framework.mjs --test test/*.test.mjs",
++    "test:public-origin": "node --import tsx --test test/public-origin-proxy.integration.mjs",
+     "check:composition": "node check-composition.mjs",
+     "check:framework": "node framework-source.mjs",
+     "build:desktop": "node build-desktop.mjs",
+diff --git a/apps/harness/profile.example.yml b/apps/harness/profile.example.yml
+index aca286e..020c60e 100644
+--- a/apps/harness/profile.example.yml
++++ b/apps/harness/profile.example.yml
+@@ -9,3 +9,7 @@
+   config:
+     host: 127.0.0.1
+     port: 3086
++# External HTTPS is not a profile wildcard. Set one exact origin on the host
++# process, then point nginx at 127.0.0.1:3086 with that host and proto:
++#   YOUDUB_PUBLIC_ORIGIN=https://7860-example.pod.compshare.cn
++#   or --public-origin https://7860-example.pod.compshare.cn
+diff --git a/apps/harness/test/credentials-stub.mjs b/apps/harness/test/credentials-stub.mjs
+new file mode 100644
+index 0000000..f24a036
+--- /dev/null
++++ b/apps/harness/test/credentials-stub.mjs
+@@ -0,0 +1,4 @@
++/** Test stand-in for the credential-key helper. BrowserAuth only needs this at runtime. */
++export function credentialKey(scope, name) {
++  return `${scope}/${name}`
++}
+diff --git a/apps/harness/test/public-origin-proxy.integration.mjs b/apps/harness/test/public-origin-proxy.integration.mjs
+new file mode 100644
+index 0000000..77bff94
+--- /dev/null
++++ b/apps/harness/test/public-origin-proxy.integration.mjs
+@@ -0,0 +1,491 @@
++/**
++ * Exact public-origin proxy: API and WebSocket admission, cookies, and auth.
++ * Requests carry the headers nginx sends to the loopback host.
++ */
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { createHash, randomBytes } from 'node:crypto'
++import { readFile } from 'node:fs/promises'
++import { createServer, request as httpRequest } from 'node:http'
++import { registerHooks } from 'node:module'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const here = dirname(fileURLToPath(import.meta.url))
++const sourceRoot = join(here, '../../../vendor/deepseek-harness/source')
++const connectionSrc = join(sourceRoot, 'packages/client/connection/src')
++const PUBLIC_HOST = '7860-cpod-1xhxbe8kv5n4.pod.compshare.cn'
++const PUBLIC_ORIGIN = `https://${PUBLIC_HOST}`
++const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
++
++registerHooks({
++  resolve(specifier, context, nextResolve) {
++    if (specifier === '@deepseek-ai/dsh-credentials') {
++      return { url: new URL('./credentials-stub.mjs', import.meta.url).href, shortCircuit: true }
++    }
++    return nextResolve(specifier, context)
++  },
++})
++
++const { parsePublicOrigin, publicUrlMatchesOrigin, requestTrustView, selectConfiguredPublicOrigin } = await import(
++  '../../../vendor/deepseek-harness/source/packages/client/connection/src/public-origin.ts',
++)
++const { isTrustedApiRequest } = await import(
++  '../../../vendor/deepseek-harness/source/packages/client/connection/src/api-request-trust.ts',
++)
++const { BrowserAuth } = await import(
++  '../../../vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts',
++)
++
++function memoryCredentials() {
++  let record
++  return {
++    async modifyRecord(_key, mutate) {
++      const next = await mutate(record)
++      if (next !== undefined) record = next
++      return record
++    },
++  }
++}
++
++function shellHtml() {
++  return `<!doctype html>
++<meta charset="utf-8">
++<title>proxy-smoke</title>
++<body><pre id="out">pending</pre>
++<script type="module">
++const lines = []
++try {
++  const described = await fetch('/api/settings/describe', {
++    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
++  })
++  lines.push('describe ' + described.status + ' ' + await described.text())
++  const youdub = await fetch('/api/youdub/v2', {
++    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
++  })
++  lines.push('youdub ' + youdub.status + ' ' + await youdub.text())
++  const wsText = await new Promise((resolve) => {
++    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/remote.mux')
++    const timer = setTimeout(() => resolve('timeout'), 5000)
++    ws.onmessage = (event) => { clearTimeout(timer); resolve(String(event.data)); ws.close() }
++    ws.onerror = () => { clearTimeout(timer); resolve('error') }
++  })
++  lines.push('ws ' + wsText)
++} catch (error) {
++  lines.push('exception ' + (error && error.message ? error.message : String(error)))
++}
++document.body.dataset.done = '1'
++document.getElementById('out').textContent = lines.join('\\n')
++</script></body>`
++}
++
++function listen(server, host = '127.0.0.1') {
++  return new Promise((resolve, reject) => {
++    server.once('error', reject)
++    server.listen(0, host, () => resolve(server.address().port))
++  })
++}
++
++function closeServer(server) {
++  return new Promise((resolve, reject) => {
++    server.close((error) => { if (error) reject(error); else resolve() })
++  })
++}
++
++async function startHost(originText = PUBLIC_ORIGIN) {
++  const publicOrigin = parsePublicOrigin(originText, 'publicOrigin')
++  const auth = await BrowserAuth.create({}, memoryCredentials(), 30)
++  const server = createServer((req, res) => {
++    try {
++    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
++    const view = requestTrustView(req, { publicOrigin, trustedHosts: [], listenerProtocol: 'http:' })
++    if (url.pathname === '/' || url.pathname === '/index.html') {
++      const ok = auth.authorizeIndex({ method: req.method, url: req.url, headers: view.headers }, res, view.secure)
++      if (!ok) return
++      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
++      res.end(shellHtml())
++      return
++    }
++    if (url.pathname === '/connect') {
++      if (!isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, '127.0.0.1', view.protocol)) {
++        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
++        res.end('forbidden')
++        return
++      }
++      auth.authorizeConnect({ method: req.method, url: req.url, headers: view.headers }, res, view.secure, () => 'operator-1')
++      return
++    }
++    if (url.pathname.startsWith('/api/')) {
++      const trusted = isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, '127.0.0.1', view.protocol)
++      if (!trusted) {
++        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
++        res.end('forbidden')
++        return
++      }
++      const seen = { headers: view.headers }
++      const allowed = auth.isAuthenticated(seen, view.secure) || auth.authenticateApi(seen, view.secure) !== undefined
++      if (!allowed) {
++        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
++        res.end('unauthorized')
++        return
++      }
++      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
++      res.end(JSON.stringify({ ok: true, path: url.pathname }))
++      return
++    }
++    res.writeHead(404)
++    res.end()
++    } catch (error) {
++      console.error('handler', error)
++      if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' })
++      res.end(error instanceof Error ? error.stack : String(error))
++    }
++  })
++  server.on('upgrade', (req, socket) => {
++    try {
++    const view = requestTrustView(req, { publicOrigin, trustedHosts: [], listenerProtocol: 'http:' })
++    const trusted = isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, '127.0.0.1', view.protocol)
++    const seen = { headers: view.headers }
++    const allowed = trusted && (auth.isAuthenticated(seen, view.secure) || auth.authenticateApi(seen, view.secure) !== undefined)
++    if (!allowed) {
++      const status = trusted ? 401 : 403
++      const reason = status === 401 ? 'Unauthorized' : 'Forbidden'
++      socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
++      socket.destroy()
++      return
++    }
++    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + WS_MAGIC).digest('base64')
++    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
++      + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`)
++    const payload = Buffer.from('ready')
++    const frame = Buffer.alloc(2 + payload.length)
++    frame[0] = 0x81
++    frame[1] = payload.length
++    payload.copy(frame, 2)
++    socket.write(frame)
++    socket.end()
++    } catch (error) {
++      console.error('upgrade', error)
++      socket.destroy()
++    }
++  })
++  server.on('clientError', (error, socket) => {
++    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
++    console.error('clientError', error.message)
++  })
++  const port = await listen(server)
++  const token = new URL(auth.authenticatedUrl(`http://127.0.0.1:${port}/`)).searchParams.get('token')
++  return {
++    port, auth, token, publicOrigin, server,
++    close: () => {
++      server.closeAllConnections()
++      return closeServer(server)
++    },
++  }
++}
++
++function call({ port, path, method = 'GET', headers = {}, body }) {
++  return new Promise((resolve, reject) => {
++    const req = httpRequest({ hostname: '127.0.0.1', port, path, method, headers, timeout: 2000 }, (res) => {
++      const chunks = []
++      res.on('data', (chunk) => chunks.push(chunk))
++      res.on('end', () => resolve({
++        status: res.statusCode,
++        headers: res.headers,
++        body: Buffer.concat(chunks).toString('utf8'),
++      }))
++    })
++    req.on('error', reject)
++    req.on('timeout', () => { req.destroy(new Error(`timeout ${method} ${path}`)) })
++    req.end(body)
++  })
++}
++
++function cookiePair(response) {
++  const raw = response.headers['set-cookie']
++  const line = Array.isArray(raw) ? raw[0] : raw
++  assert.equal(typeof line, 'string')
++  return { line, pair: line.split(';', 1)[0] }
++}
++
++function proxyHeaders(port, extra = {}) {
++  return {
++    host: `127.0.0.1:${port}`,
++    'x-forwarded-host': PUBLIC_HOST,
++    'x-forwarded-proto': 'https',
++    ...extra,
++  }
++}
++
++function openWebSocket({ port, headers }) {
++  return new Promise((resolve, reject) => {
++    const key = randomBytes(16).toString('base64')
++    const req = httpRequest({
++      hostname: '127.0.0.1',
++      port,
++      path: '/api/remote.mux',
++      headers: {
++        Connection: 'Upgrade',
++        Upgrade: 'websocket',
++        'Sec-WebSocket-Version': '13',
++        'Sec-WebSocket-Key': key,
++        ...headers,
++      },
++    })
++    const fail = (error) => { req.destroy(); reject(error) }
++    const timer = setTimeout(() => fail(new Error('websocket upgrade timeout')), 2000)
++    req.on('upgrade', (res, socket, head) => {
++      clearTimeout(timer)
++      const buf = Buffer.from(head)
++      const payload = buf.length >= 2 && buf[0] === 0x81 ? buf.subarray(2, 2 + (buf[1] & 0x7f)).toString('utf8') : ''
++      socket.destroy()
++      resolve({ status: res.statusCode, payload })
++    })
++    req.on('response', (res) => {
++      clearTimeout(timer)
++      res.resume()
++      res.on('end', () => resolve({ status: res.statusCode, payload: '' }))
++    })
++    req.on('error', (error) => { clearTimeout(timer); reject(error) })
++    req.end()
++  })
++}
++
++test('public origin parser accepts one exact host and rejects wildcards', () => {
++  const origin = parsePublicOrigin(`${PUBLIC_ORIGIN}/`, 'publicOrigin')
++  assert.equal(origin.origin, PUBLIC_ORIGIN)
++  assert.equal(origin.protocol, 'https:')
++  assert.equal(origin.hostHeader, PUBLIC_HOST)
++  assert.equal(origin.trustedAuthority, `${PUBLIC_HOST}:443`)
++  assert.equal(parsePublicOrigin(`${PUBLIC_ORIGIN}:443`).origin, PUBLIC_ORIGIN)
++  assert.equal(selectConfiguredPublicOrigin(PUBLIC_ORIGIN, 'https://other.example').origin, PUBLIC_ORIGIN)
++  assert.equal(selectConfiguredPublicOrigin(undefined, PUBLIC_ORIGIN).origin, PUBLIC_ORIGIN)
++  assert.equal(selectConfiguredPublicOrigin(undefined, undefined), undefined)
++  assert.equal(publicUrlMatchesOrigin(`${PUBLIC_ORIGIN}/ui`, origin), true)
++  assert.equal(publicUrlMatchesOrigin('https://other.example/ui', origin), false)
++  assert.throws(() => parsePublicOrigin('https://*.pod.compshare.cn'), /wildcard/)
++  assert.throws(() => parsePublicOrigin(`${PUBLIC_ORIGIN}/app`), /no path/)
++  assert.throws(() => parsePublicOrigin('https://user@host.example'), /credentials/)
++  assert.throws(() => parsePublicOrigin('http://host.example?x=1'), /query/)
++  assert.throws(() => selectConfiguredPublicOrigin(undefined, '   '), /whitespace/)
++})
++
++test('forwarded headers from a non-loopback peer do not change the fence', () => {
++  const origin = parsePublicOrigin(PUBLIC_ORIGIN)
++  const headers = {
++    host: '127.0.0.1:3086',
++    origin: PUBLIC_ORIGIN,
++    'x-forwarded-host': PUBLIC_HOST,
++    'x-forwarded-proto': 'https',
++  }
++  const remote = requestTrustView(
++    { headers, socket: { remoteAddress: '203.0.113.9' } },
++    { publicOrigin: origin, trustedHosts: [], listenerProtocol: 'http:' },
++  )
++  assert.equal(remote.proxied, false)
++  assert.equal(isTrustedApiRequest({ headers: remote.headers }, remote.trustedHosts, '127.0.0.1', remote.protocol), false)
++  const local = requestTrustView(
++    { headers, socket: { remoteAddress: '::ffff:127.0.0.1' } },
++    { publicOrigin: origin, trustedHosts: [], listenerProtocol: 'http:' },
++  )
++  assert.equal(local.proxied, true)
++  assert.equal(local.secure, true)
++  assert.equal(isTrustedApiRequest({ headers: local.headers }, local.trustedHosts, '127.0.0.1', local.protocol), true)
++  const listed = requestTrustView({
++    headers: { ...headers, 'x-forwarded-host': `${PUBLIC_HOST}, evil.example` },
++    socket: { remoteAddress: '127.0.0.1' },
++  }, { publicOrigin: origin, trustedHosts: [], listenerProtocol: 'http:' })
++  assert.equal(listed.proxied, false)
++})
++
++test('host wiring keeps the origin check and publishes the exact origin', async () => {
++  const rpc = await readFile(join(connectionSrc, 'rpc-host.ts'), 'utf8')
++  assert.match(rpc, /requestTrustView\(/)
++  assert.match(rpc, /view\.headers/)
++  assert.match(rpc, /view\.secure/)
++  const startup = await readFile(join(sourceRoot, 'packages/bundle/web-app/src/startup.ts'), 'utf8')
++  assert.match(startup, /--public-origin/)
++  assert.match(startup, /YOUDUB_PUBLIC_ORIGIN/)
++  assert.match(startup, /selectConfiguredPublicOrigin/)
++  const patch = await readFile(join(here, '../cordis.patch.yml'), 'utf8')
++  assert.match(patch, /publicOrigin: !!js ctx\.webStartup\.publicOrigin/)
++})
++
++test('authenticated external origin reaches API and WebSocket; bad token, foreign origin, and localhost stay distinct', { timeout: 10_000 }, async () => {
++  const host = await startHost()
++  try {
++    const exchanged = await call({
++      port: host.port,
++      path: `/?token=${host.token}`,
++      headers: proxyHeaders(host.port),
++    })
++    assert.equal(exchanged.status, 303)
++    const cookie = cookiePair(exchanged)
++    assert.match(cookie.line, /;\s*Secure(?:;|$)/)
++    assert.match(cookie.line, /HttpOnly/)
++    assert.match(cookie.line, /SameSite=Strict/)
++    assert.match(cookie.line, /Path=\//)
++
++    const described = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/settings/describe',
++      headers: proxyHeaders(host.port, {
++        origin: PUBLIC_ORIGIN,
++        cookie: cookie.pair,
++        'sec-fetch-site': 'same-origin',
++        'content-type': 'application/json',
++      }),
++      body: '{}',
++    })
++    assert.equal(described.status, 200)
++    assert.deepEqual(JSON.parse(described.body), { ok: true, path: '/api/settings/describe' })
++
++    const youdub = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/youdub/v2',
++      headers: proxyHeaders(host.port, {
++        origin: PUBLIC_ORIGIN,
++        cookie: cookie.pair,
++        'sec-fetch-site': 'same-origin',
++        'content-type': 'application/json',
++      }),
++      body: '{}',
++    })
++    assert.equal(youdub.status, 200)
++    assert.deepEqual(JSON.parse(youdub.body), { ok: true, path: '/api/youdub/v2' })
++
++    const socket = await openWebSocket({
++      port: host.port,
++      headers: proxyHeaders(host.port, {
++        origin: PUBLIC_ORIGIN,
++        cookie: cookie.pair,
++        'sec-fetch-site': 'same-origin',
++      }),
++    })
++    assert.equal(socket.status, 101)
++    assert.equal(socket.payload, 'ready')
++
++    const missing = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/settings/describe',
++      headers: proxyHeaders(host.port, { origin: PUBLIC_ORIGIN, 'content-type': 'application/json' }),
++      body: '{}',
++    })
++    assert.equal(missing.status, 401)
++
++    const wrongCookie = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/youdub/v2',
++      headers: proxyHeaders(host.port, {
++        origin: PUBLIC_ORIGIN,
++        cookie: 'dsh-auth-not-a-session=nope',
++        'content-type': 'application/json',
++      }),
++      body: '{}',
++    })
++    assert.equal(wrongCookie.status, 401)
++
++    const wrongToken = await call({
++      port: host.port,
++      path: '/?token=not-the-launch-token',
++      headers: proxyHeaders(host.port),
++    })
++    assert.equal(wrongToken.status, 401)
++    assert.equal(wrongToken.headers['set-cookie'], undefined)
++
++    const foreign = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/settings/describe',
++      headers: proxyHeaders(host.port, {
++        origin: 'https://evil.example',
++        cookie: cookie.pair,
++        'sec-fetch-site': 'cross-site',
++        'content-type': 'application/json',
++      }),
++      body: '{}',
++    })
++    assert.equal(foreign.status, 403)
++
++    const foreignSocket = await openWebSocket({
++      port: host.port,
++      headers: proxyHeaders(host.port, { origin: 'https://evil.example', cookie: cookie.pair }),
++    })
++    assert.equal(foreignSocket.status, 403)
++
++    const unauthenticatedSocket = await openWebSocket({
++      port: host.port,
++      headers: proxyHeaders(host.port, { origin: PUBLIC_ORIGIN }),
++    })
++    assert.equal(unauthenticatedSocket.status, 401)
++
++    const spoofedList = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/settings/describe',
++      headers: proxyHeaders(host.port, {
++        'x-forwarded-host': `${PUBLIC_HOST}, evil.example`,
++        origin: PUBLIC_ORIGIN,
++        cookie: cookie.pair,
++      }),
++      body: '{}',
++    })
++    assert.equal(spoofedList.status, 403)
++
++    const loopback = await call({
++      port: host.port,
++      path: `/?token=${host.token}`,
++      headers: { host: `127.0.0.1:${host.port}`, origin: `http://127.0.0.1:${host.port}` },
++    })
++    assert.equal(loopback.status, 303)
++    const localCookie = cookiePair(loopback)
++    assert.doesNotMatch(localCookie.line, /Secure/)
++    const localApi = await call({
++      port: host.port,
++      method: 'POST',
++      path: '/api/youdub/v2',
++      headers: {
++        host: `127.0.0.1:${host.port}`,
++        origin: `http://127.0.0.1:${host.port}`,
++        cookie: localCookie.pair,
++        'sec-fetch-site': 'same-origin',
++        'content-type': 'application/json',
++      },
++      body: '{}',
++    })
++    assert.equal(localApi.status, 200)
++    const localSocket = await openWebSocket({
++      port: host.port,
++      headers: {
++        host: `127.0.0.1:${host.port}`,
++        origin: `http://127.0.0.1:${host.port}`,
++        cookie: localCookie.pair,
++        'sec-fetch-site': 'same-origin',
++      },
++    })
++    assert.equal(localSocket.status, 101)
++    assert.equal(localSocket.payload, 'ready')
++
++    const connect = await call({
++      port: host.port,
++      path: `/connect?token=${host.token}`,
++      headers: proxyHeaders(host.port),
++    })
++    assert.equal(connect.status, 302)
++    const operator = cookiePair(connect)
++    assert.match(operator.line, /;\s*Secure(?:;|$)/)
++    const operatorSocket = await openWebSocket({
++      port: host.port,
++      headers: proxyHeaders(host.port, { origin: PUBLIC_ORIGIN, cookie: operator.pair, 'sec-fetch-site': 'same-origin' }),
++    })
++    assert.equal(operatorSocket.status, 101)
++    assert.equal(operatorSocket.payload, 'ready')
++  } finally {
++    await host.close()
++  }
++})
++
+diff --git a/artifacts/public-origin-deploy.md b/artifacts/public-origin-deploy.md
+new file mode 100644
+index 0000000..0ee33ba
+--- /dev/null
++++ b/artifacts/public-origin-deploy.md
+@@ -0,0 +1,96 @@
++# HTTPS public origin for the loopback host
++
++Apply this on deployed commit `a27041552f5bff69e2ec04f1fae1402f4d7ba5f1`. Do not hand-edit `node_modules` or `dist`. Do not print the launch token in chat.
++
++## Cause
++
++Chrome’s `Origin` is `https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn`. nginx currently forwards `Host: 127.0.0.1:3086`. `@deepseek-ai/dsh-client-connection` returns 403 unless `Origin` matches `Host`. The listener is plain HTTP, so session cookies were not `Secure`. `--public-url` only changes the printed URL. It does not admit the origin.
++
++## Patch
++
++From `/workspace/youdub-deploy/YouDub-webui`:
++
++```sh
++git apply --check artifacts/youdub-https-public-origin.patch
++git apply artifacts/youdub-https-public-origin.patch
++npm run build:framework
++```
++
++`npm run build:framework` already uses `registry.npmmirror.com`. No model download.
++
++## Host
++
++Set this only on the process that listens on `127.0.0.1:3086`:
++
++```sh
++export YOUDUB_PUBLIC_ORIGIN='https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn'
++```
++
++The same value may be passed as `--public-origin` after `--no-open`. One exact origin. A wildcard, path, or second host is rejected at startup. Unset, localhost behavior is unchanged.
++
++Restart that process in its existing tmux/nohup session. The log line `YouDub web: https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn/?token=...` is the browser URL.
++
++## nginx
++
++Keep `proxy_pass http://127.0.0.1:3086`. Do not delete or rewrite `Origin` or `Sec-Fetch-*`. The platform already terminated TLS, so `$scheme` inside the pod is `http`. Set the forwarded scheme explicitly:
++
++```nginx
++map $http_upgrade $connection_upgrade {
++  default upgrade;
++  ''      close;
++}
++server {
++  listen 7860;
++  server_name 7860-cpod-1xhxbe8kv5n4.pod.compshare.cn;
++  location / {
++    proxy_pass http://127.0.0.1:3086;
++    proxy_http_version 1.1;
++    proxy_set_header Host 127.0.0.1:3086;
++    proxy_set_header X-Forwarded-Host 7860-cpod-1xhxbe8kv5n4.pod.compshare.cn;
++    proxy_set_header X-Forwarded-Proto https;
++    proxy_set_header Upgrade $http_upgrade;
++    proxy_set_header Connection $connection_upgrade;
++    proxy_read_timeout 3600s;
++    proxy_send_timeout 3600s;
++    proxy_buffering off;
++  }
++}
++```
++
++`nginx -t && nginx -s reload`
++
++## After the UI works
++
++Write only the full `https://...?token=...` URL to `/workspace/access_link.txt` and `chmod 0600` it. Do not put that token in chat.
++
++## Rollback
++
++```sh
++git apply -R artifacts/youdub-https-public-origin.patch
++unset YOUDUB_PUBLIC_ORIGIN
++npm run build:framework
++```
++
++Restore the previous nginx file, reload nginx, and restart the host.
++
++## Already applied the previous patch
++
++If `2706b4d` is already applied and `npm run build:framework` stopped on `TS6133` for unused `isTrusted`, apply only the correction, then rebuild:
++
++```sh
++git apply --check artifacts/youdub-https-public-origin-since-2706b4d.patch
++git apply artifacts/youdub-https-public-origin-since-2706b4d.patch
++npm run build:framework
++```
++
++That patch deletes the unused private method. Admission still goes through `viewIsTrusted`. Do not restart the old host until this rebuild finishes.
++
++## What was verified here
++
++`npm run build:framework` completed (`EXIT:0`), including the host TypeScript compile that previously reported `rpc-host.ts` `TS6133`.
++
++`node --import tsx --test apps/harness/test/public-origin-proxy.integration.mjs` (tsx 4.20.6): 4 passing.
++
++Covered: exact origin parse and wildcard rejection; forwarded headers from a non-loopback peer ignored; authenticated `https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn` `POST /api/settings/describe`, `POST /api/youdub/v2`, and WebSocket `/api/remote.mux` 101 with a frame; missing cookie, wrong cookie, and wrong token 401; foreign Origin and a comma-joined forwarded host 403; direct `http://127.0.0.1:<port>` cookie without `Secure`, API 200, and WebSocket 101.
++
++Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
+diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
+index c3a6b1d..c54c66f 100644
+--- a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
++++ b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
+@@ -1,6 +1,6 @@
+ /**
+  * The web app's command-line provider: it parses the `npm run dev:web --` flag
+- * family (`--host`, `--port`, `--public-url`, `--trusted-host`, `--no-open`, TLS)
++ * family (`--host`, `--port`, `--public-url`, `--public-origin`, `--trusted-host`, `--no-open`, TLS)
+  * and its `--help` text, then provides the immutable values as
+  * {@link WEB_STARTUP_SERVICE}. Ordinary rows inject that service before
+  * reading it from lazy config.
+@@ -11,6 +11,7 @@ import { Command } from 'commander'
+ import type { Context } from '@deepseek-ai/cordis'
+ import { parseCmdline } from '@deepseek-ai/dsh-cmdline'
+ import { isWildcardHost, type TlsConfig } from '@deepseek-ai/dsh-host-webserver'
++import { publicUrlMatchesOrigin, selectConfiguredPublicOrigin } from '@deepseek-ai/dsh-client-connection'
+ import { parsePublicUrl } from './public-url.ts'
+ 
+ /** Stable Cordis plugin name. */
+@@ -35,6 +36,11 @@ export interface WebStartupValues {
+    * See [public deployments](../README.md#public-deployments).
+    */
+   publicUrl?: string
++  /**
++   * Exact public origin admitted from a loopback proxy, absent when neither
++   * `--public-origin` nor `YOUDUB_PUBLIC_ORIGIN` is set.
++   */
++  publicOrigin?: string
+   /** Explicit `--trusted-host` authorities, in argument order. */
+   trustedHosts: string[]
+   /** Server certificate chain and unencrypted private key supplied together. */
+@@ -47,6 +53,7 @@ interface WebOptions {
+   open: boolean
+   port?: string
+   publicUrl?: string
++  publicOrigin?: string
+   trustedHost?: string[]
+   tlsCert?: string
+   tlsKey?: string
+@@ -65,6 +72,7 @@ function webCommand(): Command {
+     .option('--no-open', 'do not open the Web UI in the default browser')
+     .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
+     .option('--public-url <url>', 'advertise this HTTP(S) root in the printed and opened URL; grants no trust')
++    .option('--public-origin <origin>', 'exact public http(s)://host[:port] of a loopback TLS-terminating proxy; also read from YOUDUB_PUBLIC_ORIGIN')
+     .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
+     .option('--tls-cert <file>', 'PEM server certificate chain; requires --tls-key')
+     .option('--tls-key <file>', 'unencrypted PEM private key; requires --tls-cert')
+@@ -76,6 +84,8 @@ Examples:
+   npm run dev:web -- --host 10.0.0.7         bind one local interface address
+   npm run dev:web -- --public-url https://app.example/ui/ --trusted-host app.example
+                                              advertise a prefix-stripping HTTPS proxy entry and admit its authority
++  npm run dev:web -- --public-origin https://app.example
++                                             trust one exact HTTPS origin from loopback X-Forwarded-Host/Proto and advertise it
+   npm run dev:web -- --tls-cert ./server-chain.pem --tls-key ./server-key.pem
+                                              serve HTTPS with an existing certificate and key
+ `)
+@@ -111,11 +121,23 @@ export function apply(ctx: Context): void {
+         program.error(`error: ${(error as Error).message}`)
+       }
+     }
++    let publicOrigin: ReturnType<typeof selectConfiguredPublicOrigin>
++    try {
++      publicOrigin = selectConfiguredPublicOrigin(options.publicOrigin, process.env.YOUDUB_PUBLIC_ORIGIN)
++    } catch (error) {
++      program.error(`error: ${(error as Error).message}`)
++    }
++    if (publicOrigin !== undefined && options.publicUrl !== undefined
++      && !publicUrlMatchesOrigin(options.publicUrl, publicOrigin)) {
++      program.error('error: --public-url origin must equal --public-origin / YOUDUB_PUBLIC_ORIGIN')
++    }
++    const publicUrl = options.publicUrl ?? (publicOrigin === undefined ? undefined : `${publicOrigin.origin}/`)
+     ctx.provide(WEB_STARTUP_SERVICE, {
+       openBrowser: options.open,
+       ...options.host !== undefined && { host: options.host },
+       ...options.port !== undefined && { port: Number(options.port) },
+-      ...options.publicUrl !== undefined && { publicUrl: options.publicUrl },
++      ...publicUrl !== undefined && { publicUrl },
++      ...publicOrigin !== undefined && { publicOrigin: publicOrigin.origin },
+       ...tls !== undefined && { tls },
+       trustedHosts: options.trustedHost ?? [],
+     } satisfies WebStartupValues)
+diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
+index 4aa8ed3..e6b23d3 100644
+--- a/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
++++ b/vendor/deepseek-harness/source/packages/bundle/web-app/tests/startup.spec.ts
+@@ -37,7 +37,7 @@ afterEach(async () => {
+  * @param args - the invocation's inner arguments.
+  * @returns the service value and observed consumer/process effects.
+  */
+-async function bootProvider(args: string[]): Promise<{
++async function bootProvider(args: string[], originEnv?: string): Promise<{
+   values: WebStartupValues | undefined
+   observed: Observed
+ }> {
+@@ -63,12 +63,20 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
+     '    openBrowser: !!js ctx.webStartup.openBrowser',
+     '    port: !!js ctx.webStartup.port ?? 3080',
+     '    publicUrl: !!js ctx.webStartup.publicUrl',
++    '    publicOrigin: !!js ctx.webStartup.publicOrigin',
+     '    trustedHosts: !!js ctx.webStartup.trustedHosts',
+     '    tls: !!js ctx.webStartup.tls',
+     '- id: provider',
+     `  name: ${pathToFileURL(join(dir, 'provider.mjs')).href}`,
+     '',
+   ].join('\n'))
++  const savedOrigin = process.env.YOUDUB_PUBLIC_ORIGIN
++  delete process.env.YOUDUB_PUBLIC_ORIGIN
++  if (originEnv !== undefined) process.env.YOUDUB_PUBLIC_ORIGIN = originEnv
++  disposers.push(async () => {
++    if (savedOrigin === undefined) delete process.env.YOUDUB_PUBLIC_ORIGIN
++    else process.env.YOUDUB_PUBLIC_ORIGIN = savedOrigin
++  })
+   const observe = (chunk: string | Uint8Array): boolean => { observed.out += String(chunk); return true }
+   vi.spyOn(process.stdout, 'write').mockImplementation(observe)
+   vi.spyOn(process.stderr, 'write').mockImplementation(observe)
+@@ -140,6 +148,7 @@ describe('web command-line provider', () => {
+     expect(observed.out).toContain('npm run dev:web --')
+     expect(observed.out).toContain('--no-open')
+     expect(observed.out).toContain('--public-url')
++    expect(observed.out).toContain('--public-origin')
+     expect(observed.out).toContain('--trusted-host')
+     expect(values).toBeUndefined()
+     expect(observed.readerConfig).toBeUndefined()
+@@ -182,6 +191,41 @@ describe('web command-line provider', () => {
+     expect(observed.exits).toEqual([1])
+   })
+ 
++  it('publishes one exact --public-origin and advertises that origin', async () => {
++    const origin = 'https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn'
++    const { values, observed } = await bootProvider(['--public-origin', origin, '--no-open'])
++    expect(values).toEqual({
++      openBrowser: false,
++      publicOrigin: origin,
++      publicUrl: `${origin}/`,
++      trustedHosts: [],
++    })
++    expect(observed.readerConfig).toMatchObject({ publicOrigin: origin, publicUrl: `${origin}/` })
++    expect(observed.exits).toEqual([])
++  })
++
++  it('reads YOUDUB_PUBLIC_ORIGIN when --public-origin is omitted', async () => {
++    const { values } = await bootProvider(['--no-open'], 'https://app.example')
++    expect(values).toMatchObject({
++      publicOrigin: 'https://app.example',
++      publicUrl: 'https://app.example/',
++    })
++  })
++
++  it('rejects a wildcard or mismatched public origin before the consumer activates', async () => {
++    const wildcard = await bootProvider(['--public-origin', 'https://*.pod.compshare.cn'])
++    expect(wildcard.observed.out).toContain('not a wildcard')
++    expect(wildcard.values).toBeUndefined()
++    expect(wildcard.observed.exits).toEqual([1])
++    const mismatch = await bootProvider([
++      '--public-origin', 'https://app.example',
++      '--public-url', 'https://other.example/ui',
++    ])
++    expect(mismatch.observed.out).toContain('--public-url origin must equal')
++    expect(mismatch.values).toBeUndefined()
++    expect(mismatch.observed.exits).toEqual([1])
++  })
++
+   it('rejects a malformed --public-url before the consumer activates', async () => {
+     // The parser's own suite owns the exhaustive spellings; the provider only
+     // has to fail the invocation before any consumer activates.
+diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts b/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
+index caeafc3..378d448 100644
+--- a/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
++++ b/vendor/deepseek-harness/source/packages/client/connection/src/browser-auth.ts
+@@ -254,10 +254,10 @@ export class BrowserAuth {
+    * 401 response.
+    * @param req - incoming root or configured-index request.
+    * @param res - response owned when this method returns false.
+-   * @param secure - whether the listener receiving this request serves TLS; the
+-   * minted cookie carries `Secure` when it does. Only that listener's own
+-   * protocol decides, never a `publicUrl` announcement or a forwarded header:
+-   * those describe a hop this process does not terminate.
++   * @param secure - whether the minted cookie carries `Secure`. The caller
++   * passes true for a TLS listener, or for one request whose forwarded
++   * identity exactly matches the configured public HTTPS origin. This method
++   * does not read `publicUrl` or forwarded headers itself.
+    * @returns true only when the caller may serve index.html.
+    */
+   authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse, secure = false): boolean {
+diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/index.ts b/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
+index 4b8c1e3..59fdf50 100644
+--- a/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
++++ b/vendor/deepseek-harness/source/packages/client/connection/src/index.ts
+@@ -10,6 +10,7 @@ import { CONNECT_PATH } from './connect-protocol.ts'
+ import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
+ import { assertTrustedAuthority } from './api-request-trust.ts'
+ import { BrowserAuth } from './browser-auth.ts'
++import { parsePublicOrigin } from './public-origin.ts'
+ import { HostConnectionService } from './rpc-host.ts'
+ import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
+ 
+@@ -52,6 +53,7 @@ export {
+ export { HostConnectionService } from './rpc-host.ts'
+ 
+ export { API_PATH } from './api-path.ts'
++export { parsePublicOrigin, publicUrlMatchesOrigin, selectConfiguredPublicOrigin } from './public-origin.ts'
+ 
+ /** Stable Cordis plugin name. */
+ export const name = 'client-connection'
+@@ -84,6 +86,13 @@ export interface ConnectionConfig {
+    * an entry here. A non-canonical or non-bare authority fails plugin load.
+    */
+   trustedHosts?: string[]
++  /**
++   * One exact public `http(s)://host[:port]` origin served by a loopback
++   * reverse proxy. When `X-Forwarded-Proto` and `X-Forwarded-Host` from that
++   * peer equal this origin, API and WebSocket checks and the auth cookie use
++   * it. Any other forwarded value is ignored. A wildcard is rejected.
++   */
++  publicOrigin?: string
+   /** Absolute browser and API cookie lifetime in days. Default: 30. */
+   cookieMaxAgeDays?: number
+   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
+@@ -93,6 +102,7 @@ export interface ConnectionConfig {
+ export const Config: z<ConnectionConfig> = z.object({
+   recovery: ConnectionRecoveryConfigSchema.default({}),
+   trustedHosts: z.array(String).default([]),
++  publicOrigin: z.string(),
+   cookieMaxAgeDays: z.natural().min(1).default(30),
+   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+ })
+@@ -113,11 +123,14 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
+   // Config boundary: a malformed entry fails the load loudly here rather than
+   // silently authorizing its hostname prefix at request time.
+   for (const entry of trustedHosts) assertTrustedAuthority(entry)
+-  const connection = new HostConnectionService(
+-    ctx,
+-    trustedHosts,
+-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+-  )
++  const rawOrigin = config?.publicOrigin
++  const publicOrigin = typeof rawOrigin === 'string' && rawOrigin !== ''
++    ? parsePublicOrigin(rawOrigin, 'publicOrigin')
++    : undefined
++  const browserAuth = await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays)
++  const connection = publicOrigin === undefined
++    ? new HostConnectionService(ctx, trustedHosts, browserAuth)
++    : new HostConnectionService(ctx, trustedHosts, browserAuth, publicOrigin)
+   ctx.inject(['webServer'], (webCtx) => {
+     webCtx.on('webserver/index-inject', (table) => {
+       table.push({ kind: 'global', name: '__DSH_CONNECTION_RECOVERY__', value: recovery })
+diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/public-origin.ts b/vendor/deepseek-harness/source/packages/client/connection/src/public-origin.ts
+new file mode 100644
+index 0000000..57f7ace
+--- /dev/null
++++ b/vendor/deepseek-harness/source/packages/client/connection/src/public-origin.ts
+@@ -0,0 +1,197 @@
++/**
++ * Exact public origin of one TLS-terminating reverse proxy.
++ * The listener stays on loopback HTTP. A request is treated as that origin
++ * only when the immediate peer is loopback and both forwarded headers equal
++ * this origin exactly. Anything else keeps the raw Host and the listener
++ * scheme, so localhost behavior and the Host/Origin fence stay intact.
++ * @module @deepseek-ai/dsh-client-connection/public-origin
++ */
++
++import { assertTrustedAuthority } from './api-request-trust.ts'
++import { isLoopbackHostname } from './loopback-hostname.ts'
++import type { ConnectionTrustRequest } from './rpc.ts'
++
++/** One configured browser origin. The authority grant is exact, including the default port. */
++export interface PublicOrigin {
++  /** `scheme://host` with the default port omitted, matching `URL.origin`. */
++  readonly origin: string
++  readonly protocol: 'http:' | 'https:'
++  /** Host header spelling browsers use for this origin. */
++  readonly hostHeader: string
++  /** `hostname:port`, including 80 or 443, so the grant cannot match every port. */
++  readonly trustedAuthority: string
++}
++
++/** Headers plus the optional socket peer. Forged forwarded headers from anywhere else are ignored. */
++export interface TrustPeerRequest {
++  readonly headers: ConnectionTrustRequest['headers']
++  readonly socket?: { readonly remoteAddress?: string | null | undefined } | null
++}
++
++/** Facts the Host fence and cookie audience consume for one request. */
++export interface RequestTrustView {
++  readonly headers: ConnectionTrustRequest['headers']
++  readonly secure: boolean
++  readonly trustedHosts: readonly string[]
++  readonly protocol: 'http:' | 'https:'
++  /** True only when this request's forwarded identity matched {@link PublicOrigin}. */
++  readonly proxied: boolean
++}
++
++const CONTROL = /[\u0000-\u0020\u007f]/u
++
++/**
++ * Parse one exact public origin. Wildcards, paths, userinfo, and lists are rejected.
++ * @param value - `http(s)://host[:port][/]`.
++ * @param label - flag or setting name included in the error.
++ * @returns the normalized origin and the exact authority the fence will grant.
++ */
++export function parsePublicOrigin(value: string, label = 'publicOrigin'): PublicOrigin {
++  if (CONTROL.test(value)) {
++    throw new Error(`${label} must not contain ASCII whitespace or control characters`)
++  }
++  if (value.includes('*')) {
++    throw new Error(`${label} must be one exact http(s) origin, not a wildcard`)
++  }
++  if (value.includes('?') || value.includes('#')) {
++    throw new Error(`${label} must not include a query or fragment`)
++  }
++  if (!/^https?:\/\//iu.test(value)) {
++    throw new Error(`${label} must be an absolute http or https origin`)
++  }
++  const url = URL.parse(value)
++  if (url === null || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
++    throw new Error(`${label} must be an absolute http or https origin`)
++  }
++  if (url.username !== '' || url.password !== '') {
++    throw new Error(`${label} must not include credentials`)
++  }
++  if (url.pathname !== '/' || url.search !== '' || url.hash !== '') {
++    throw new Error(`${label} must be an origin with no path, query, or fragment`)
++  }
++  if (url.hostname === '' || url.hostname.includes('*')) {
++    throw new Error(`${label} must name one exact host`)
++  }
++  const port = url.port !== '' ? url.port : (url.protocol === 'https:' ? '443' : '80')
++  const trustedAuthority = `${url.hostname}:${port}`
++  try {
++    assertTrustedAuthority(trustedAuthority)
++  } catch {
++    throw new Error(`${label} must name one exact host`)
++  }
++  return {
++    origin: url.origin,
++    protocol: url.protocol as 'http:' | 'https:',
++    hostHeader: url.host,
++    trustedAuthority,
++  }
++}
++
++/**
++ * Choose the process's one public origin. An explicit flag wins; otherwise the
++ * environment variable is used. An empty or malformed value fails the load.
++ * @param flag - `--public-origin`, when the invocation passed it.
++ * @param envValue - `YOUDUB_PUBLIC_ORIGIN`, when the flag was omitted.
++ * @returns the parsed origin, or undefined when neither source is set.
++ */
++export function selectConfiguredPublicOrigin(
++  flag: string | undefined,
++  envValue: string | undefined,
++): PublicOrigin | undefined {
++  if (flag !== undefined) return parsePublicOrigin(flag, '--public-origin')
++  if (envValue === undefined) return undefined
++  return parsePublicOrigin(envValue, 'YOUDUB_PUBLIC_ORIGIN')
++}
++
++/**
++ * Whether an advertised URL names the same origin the proxy is allowed to assert.
++ * @param publicUrl - `--public-url` value, which may include a path prefix.
++ * @param origin - configured public origin.
++ * @returns true when both parse to the same `URL.origin`.
++ */
++export function publicUrlMatchesOrigin(publicUrl: string, origin: PublicOrigin): boolean {
++  const url = URL.parse(publicUrl)
++  return url !== null && url.origin === origin.origin
++}
++
++function headerValue(headers: ConnectionTrustRequest['headers'], name: string): string | undefined {
++  if (headers instanceof Headers) {
++    const value = headers.get(name)
++    return value === null ? undefined : value
++  }
++  const value = headers[name]
++  return typeof value === 'string' ? value : undefined
++}
++
++/** A single token. Comma-separated proxy lists and padded values fail closed. */
++function exactToken(value: string | undefined): string | undefined {
++  if (value === undefined || value === '' || /[\s,]/u.test(value)) return undefined
++  return value
++}
++
++function forwardedOrigin(proto: string, host: string): string | undefined {
++  const scheme = proto.toLowerCase()
++  if (scheme !== 'http' && scheme !== 'https') return undefined
++  if (/[@/\\?#*]/u.test(host)) return undefined
++  const url = URL.parse(`${scheme}://${host}`)
++  if (url === null || url.username !== '' || url.password !== '' || url.pathname !== '/') return undefined
++  return url.origin
++}
++
++function isLoopbackPeer(address: string | null | undefined): boolean {
++  if (address === undefined || address === null || address === '') return false
++  if (address === '::1') return true
++  const mapped = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address
++  return isLoopbackHostname(mapped)
++}
++
++function headersWithHost(
++  headers: ConnectionTrustRequest['headers'],
++  host: string,
++): ConnectionTrustRequest['headers'] {
++  if (headers instanceof Headers) {
++    const copy = new Headers(headers)
++    copy.set('host', host)
++    return copy
++  }
++  return { ...headers, host }
++}
++
++/**
++ * Resolve the authority a request is allowed to claim.
++ * Forwarded headers count only from a loopback peer and only when their
++ * origin is exactly the configured one. The raw Host is then replaced for
++ * the fence and the cookie audience; the browser's Origin header is left
++ * unchanged and still has to match.
++ * @param request - node HTTP request, including its socket peer when present.
++ * @param options - deployment grant and the listener's own scheme.
++ * @returns the headers, scheme, and trusted authorities the fence should see.
++ */
++export function requestTrustView(
++  request: TrustPeerRequest,
++  options: {
++    readonly publicOrigin?: PublicOrigin
++    readonly trustedHosts: readonly string[]
++    readonly listenerProtocol: 'http:' | 'https:'
++  },
++): RequestTrustView {
++  const direct: RequestTrustView = {
++    headers: request.headers,
++    secure: options.listenerProtocol === 'https:',
++    trustedHosts: options.trustedHosts,
++    protocol: options.listenerProtocol,
++    proxied: false,
++  }
++  const origin = options.publicOrigin
++  if (origin === undefined || !isLoopbackPeer(request.socket?.remoteAddress)) return direct
++  const proto = exactToken(headerValue(request.headers, 'x-forwarded-proto'))
++  const host = exactToken(headerValue(request.headers, 'x-forwarded-host'))
++  if (proto === undefined || host === undefined || forwardedOrigin(proto, host) !== origin.origin) return direct
++  return {
++    headers: headersWithHost(request.headers, origin.hostHeader),
++    secure: origin.protocol === 'https:',
++    trustedHosts: [...options.trustedHosts, origin.trustedAuthority],
++    protocol: origin.protocol,
++    proxied: true,
++  }
++}
+diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts b/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
+index 061f884..3293989 100644
+--- a/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
++++ b/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
+@@ -12,6 +12,7 @@ import {
+ import { clientRequestSchema } from './rpc-schema.ts'
+ import { bridge } from './http-bridge.ts'
+ import { isTrustedApiRequest } from './api-request-trust.ts'
++import { requestTrustView, type PublicOrigin, type RequestTrustView } from './public-origin.ts'
+ import { API_PATH } from './api-path.ts'
+ import type { BrowserAuth } from './browser-auth.ts'
+ import { Peer } from './peer.ts'
+@@ -85,6 +86,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
+     ctx: Context,
+     private readonly trustedHosts: readonly string[],
+     private readonly browserAuth: BrowserAuth,
++    private readonly publicOrigin?: PublicOrigin,
+   ) {
+     super(ctx, 'connection')
+     this.owner = ctx
+@@ -117,11 +119,12 @@ export class HostConnectionService extends Service implements HostConnectionHand
+ 
+   /** Browser requests share an owner Peer; API HTTP does not depend on an attached socket. */
+   admit(request: ConnectionTrustRequest): PeerAdmission {
+-    if (!this.isTrusted(request)) return { rejection: 403 }
++    const view = this.trustContext(request)
++    if (!this.viewIsTrusted(view)) return { rejection: 403 }
+     if (this.disposed) return { rejection: 401 }
+-    const secure = this.owner.get('webServer')?.protocol === 'https:'
+-    if (this.browserAuth.isAuthenticated(request, secure)) return { peer: this.browserPeer }
+-    const id = this.browserAuth.authenticateApi(request, secure)
++    const seen = { headers: view.headers }
++    if (this.browserAuth.isAuthenticated(seen, view.secure)) return { peer: this.browserPeer }
++    const id = this.browserAuth.authenticateApi(seen, view.secure)
+     const record = id === undefined ? undefined : this.peers.get(id)
+     return record === undefined ? { rejection: 401 } : { peer: record.peer }
+   }
+@@ -146,9 +149,22 @@ export class HostConnectionService extends Service implements HostConnectionHand
+     }
+   }
+ 
+-  private isTrusted(request: ConnectionTrustRequest): boolean {
++  /**
++   * Host, scheme, and cookie audience for one request. A configured public
++   * origin replaces the loopback Host only when the proxy headers match it.
++   */
++  private trustContext(request: ConnectionTrustRequest): RequestTrustView {
++    const carrier = this.owner.get('webServer')
++    return requestTrustView(request, {
++      ...this.publicOrigin !== undefined ? { publicOrigin: this.publicOrigin } : {},
++      trustedHosts: this.trustedHosts,
++      listenerProtocol: carrier?.protocol ?? 'http:',
++    })
++  }
++
++  private viewIsTrusted(view: RequestTrustView): boolean {
+     const carrier = this.owner.get('webServer')
+-    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
++    return isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, carrier?.host, view.protocol)
+   }
+ 
+   private publishPeer(interactions: ConnectionInteractions): PeerId {
+@@ -163,20 +179,30 @@ export class HostConnectionService extends Service implements HostConnectionHand
+    * @param response - response owned to completion.
+    */
+   authorizeConnect(request: ConnectionIndexRequest, response: ConnectionIndexResponse): void {
+-    if (!this.isTrusted(request) || this.disposed) {
++    const view = this.trustContext(request)
++    if (!this.viewIsTrusted(view) || this.disposed) {
+       response.writeHead(this.disposed ? 401 : 403)
+       response.end(this.disposed ? 'unauthorized' : 'forbidden')
+       return
+     }
+-    this.browserAuth.authorizeConnect(request, response,
+-      this.owner.get('webServer')?.protocol === 'https:', interactions => this.publishPeer(interactions))
++    this.browserAuth.authorizeConnect({
++      method: request.method,
++      url: request.url,
++      headers: view.headers,
++    }, response, view.secure, interactions => this.publishPeer(interactions))
+   }
+ 
+   /**
+-   * Authenticate an index request; native TLS listeners mint Secure cookies.
++   * Authenticate an index request. Secure cookies follow the listener, or the
++   * configured public HTTPS origin when this request's proxy headers match it.
+    */
+   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean {
+-    return this.browserAuth.authorizeIndex(request, response, this.ctx.get('webServer')?.protocol === 'https:')
++    const view = this.trustContext(request)
++    return this.browserAuth.authorizeIndex({
++      method: request.method,
++      url: request.url,
++      headers: view.headers,
++    }, response, view.secure)
+   }
+ 
+   /** Add this process's launch token to the clean application URL. */
+diff --git a/vendor/deepseek-harness/source/packages/client/connection/tsconfig.host.json b/vendor/deepseek-harness/source/packages/client/connection/tsconfig.host.json
+index 0ebe806..cc5e85e 100644
+--- a/vendor/deepseek-harness/source/packages/client/connection/tsconfig.host.json
++++ b/vendor/deepseek-harness/source/packages/client/connection/tsconfig.host.json
+@@ -16,6 +16,7 @@
+     "src/index.ts",
+     "src/loopback-hostname.ts",
+     "src/peer.ts",
++    "src/public-origin.ts",
+     "src/recovery-config.ts",
+     "src/rpc-host.ts",
+     "src/rpc-schema.ts",

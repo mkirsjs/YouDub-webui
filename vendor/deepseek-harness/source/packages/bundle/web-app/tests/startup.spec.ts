@@ -37,7 +37,7 @@ afterEach(async () => {
  * @param args - the invocation's inner arguments.
  * @returns the service value and observed consumer/process effects.
  */
-async function bootProvider(args: string[]): Promise<{
+async function bootProvider(args: string[], originEnv?: string): Promise<{
   values: WebStartupValues | undefined
   observed: Observed
 }> {
@@ -63,12 +63,20 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
     '    openBrowser: !!js ctx.webStartup.openBrowser',
     '    port: !!js ctx.webStartup.port ?? 3080',
     '    publicUrl: !!js ctx.webStartup.publicUrl',
+    '    publicOrigin: !!js ctx.webStartup.publicOrigin',
     '    trustedHosts: !!js ctx.webStartup.trustedHosts',
     '    tls: !!js ctx.webStartup.tls',
     '- id: provider',
     `  name: ${pathToFileURL(join(dir, 'provider.mjs')).href}`,
     '',
   ].join('\n'))
+  const savedOrigin = process.env.YOUDUB_PUBLIC_ORIGIN
+  delete process.env.YOUDUB_PUBLIC_ORIGIN
+  if (originEnv !== undefined) process.env.YOUDUB_PUBLIC_ORIGIN = originEnv
+  disposers.push(async () => {
+    if (savedOrigin === undefined) delete process.env.YOUDUB_PUBLIC_ORIGIN
+    else process.env.YOUDUB_PUBLIC_ORIGIN = savedOrigin
+  })
   const observe = (chunk: string | Uint8Array): boolean => { observed.out += String(chunk); return true }
   vi.spyOn(process.stdout, 'write').mockImplementation(observe)
   vi.spyOn(process.stderr, 'write').mockImplementation(observe)
@@ -140,6 +148,7 @@ describe('web command-line provider', () => {
     expect(observed.out).toContain('npm run dev:web --')
     expect(observed.out).toContain('--no-open')
     expect(observed.out).toContain('--public-url')
+    expect(observed.out).toContain('--public-origin')
     expect(observed.out).toContain('--trusted-host')
     expect(values).toBeUndefined()
     expect(observed.readerConfig).toBeUndefined()
@@ -180,6 +189,41 @@ describe('web command-line provider', () => {
     expect(values).toBeUndefined()
     expect(observed.readerConfig).toBeUndefined()
     expect(observed.exits).toEqual([1])
+  })
+
+  it('publishes one exact --public-origin and advertises that origin', async () => {
+    const origin = 'https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn'
+    const { values, observed } = await bootProvider(['--public-origin', origin, '--no-open'])
+    expect(values).toEqual({
+      openBrowser: false,
+      publicOrigin: origin,
+      publicUrl: `${origin}/`,
+      trustedHosts: [],
+    })
+    expect(observed.readerConfig).toMatchObject({ publicOrigin: origin, publicUrl: `${origin}/` })
+    expect(observed.exits).toEqual([])
+  })
+
+  it('reads YOUDUB_PUBLIC_ORIGIN when --public-origin is omitted', async () => {
+    const { values } = await bootProvider(['--no-open'], 'https://app.example')
+    expect(values).toMatchObject({
+      publicOrigin: 'https://app.example',
+      publicUrl: 'https://app.example/',
+    })
+  })
+
+  it('rejects a wildcard or mismatched public origin before the consumer activates', async () => {
+    const wildcard = await bootProvider(['--public-origin', 'https://*.pod.compshare.cn'])
+    expect(wildcard.observed.out).toContain('not a wildcard')
+    expect(wildcard.values).toBeUndefined()
+    expect(wildcard.observed.exits).toEqual([1])
+    const mismatch = await bootProvider([
+      '--public-origin', 'https://app.example',
+      '--public-url', 'https://other.example/ui',
+    ])
+    expect(mismatch.observed.out).toContain('--public-url origin must equal')
+    expect(mismatch.values).toBeUndefined()
+    expect(mismatch.observed.exits).toEqual([1])
   })
 
   it('rejects a malformed --public-url before the consumer activates', async () => {
