@@ -73,10 +73,24 @@ npm run build:framework
 
 Restore the previous nginx file, reload nginx, and restart the host.
 
+## Already applied the previous patch
+
+If `2706b4d` is already applied and `npm run build:framework` stopped on `TS6133` for unused `isTrusted`, apply only the correction, then rebuild:
+
+```sh
+git apply --check artifacts/youdub-https-public-origin-since-2706b4d.patch
+git apply artifacts/youdub-https-public-origin-since-2706b4d.patch
+npm run build:framework
+```
+
+That patch deletes the unused private method. Admission still goes through `viewIsTrusted`. Do not restart the old host until this rebuild finishes.
+
 ## What was verified here
+
+`npm run build:framework` completed (`EXIT:0`), including the host TypeScript compile that previously reported `rpc-host.ts` `TS6133`.
 
 `node --import tsx --test apps/harness/test/public-origin-proxy.integration.mjs` (tsx 4.20.6): 4 passing.
 
 Covered: exact origin parse and wildcard rejection; forwarded headers from a non-loopback peer ignored; authenticated `https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn` `POST /api/settings/describe`, `POST /api/youdub/v2`, and WebSocket `/api/remote.mux` 101 with a frame; missing cookie, wrong cookie, and wrong token 401; foreign Origin and a comma-joined forwarded host 403; direct `http://127.0.0.1:<port>` cookie without `Secure`, API 200, and WebSocket 101.
 
-Not verified: framework rebuild, the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
+Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.

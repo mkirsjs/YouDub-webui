@@ -167,10 +167,6 @@ export class HostConnectionService extends Service implements HostConnectionHand
     return isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, carrier?.host, view.protocol)
   }
 
-  private isTrusted(request: ConnectionTrustRequest): boolean {
-    return this.viewIsTrusted(this.trustContext(request))
-  }
-
   private publishPeer(interactions: ConnectionInteractions): PeerId {
     const peer = new Peer(this.owner, { principal: { kind: 'owner' }, interactions })
     this.peers.set(peer.id, { peer, ownsSocket: false })

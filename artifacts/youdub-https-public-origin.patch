@@ -543,10 +543,10 @@ index 0000000..77bff94
 +
 diff --git a/artifacts/public-origin-deploy.md b/artifacts/public-origin-deploy.md
 new file mode 100644
-index 0000000..151e2b6
+index 0000000..0ee33ba
 --- /dev/null
 +++ b/artifacts/public-origin-deploy.md
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,96 @@
 +# HTTPS public origin for the loopback host
 +
 +Apply this on deployed commit `a27041552f5bff69e2ec04f1fae1402f4d7ba5f1`. Do not hand-edit `node_modules` or `dist`. Do not print the launch token in chat.
@@ -622,13 +622,27 @@ index 0000000..151e2b6
 +
 +Restore the previous nginx file, reload nginx, and restart the host.
 +
++## Already applied the previous patch
++
++If `2706b4d` is already applied and `npm run build:framework` stopped on `TS6133` for unused `isTrusted`, apply only the correction, then rebuild:
++
++```sh
++git apply --check artifacts/youdub-https-public-origin-since-2706b4d.patch
++git apply artifacts/youdub-https-public-origin-since-2706b4d.patch
++npm run build:framework
++```
++
++That patch deletes the unused private method. Admission still goes through `viewIsTrusted`. Do not restart the old host until this rebuild finishes.
++
 +## What was verified here
++
++`npm run build:framework` completed (`EXIT:0`), including the host TypeScript compile that previously reported `rpc-host.ts` `TS6133`.
 +
 +`node --import tsx --test apps/harness/test/public-origin-proxy.integration.mjs` (tsx 4.20.6): 4 passing.
 +
 +Covered: exact origin parse and wildcard rejection; forwarded headers from a non-loopback peer ignored; authenticated `https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn` `POST /api/settings/describe`, `POST /api/youdub/v2`, and WebSocket `/api/remote.mux` 101 with a frame; missing cookie, wrong cookie, and wrong token 401; foreign Origin and a comma-joined forwarded host 403; direct `http://127.0.0.1:<port>` cookie without `Secure`, API 200, and WebSocket 101.
 +
-+Not verified: framework rebuild, the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
++Not verified here: the deployed Electron process, the real workbench page, file upload, or GPU inference. Those stay with the coordinator.
 diff --git a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts b/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
 index c3a6b1d..c54c66f 100644
 --- a/vendor/deepseek-harness/source/packages/bundle/web-app/src/startup.ts
@@ -1080,7 +1094,7 @@ index 0000000..57f7ace
 +  }
 +}
 diff --git a/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts b/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
-index 061f884..f0495dd 100644
+index 061f884..3293989 100644
 --- a/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
 +++ b/vendor/deepseek-harness/source/packages/client/connection/src/rpc-host.ts
 @@ -12,6 +12,7 @@ import {
@@ -1116,7 +1130,7 @@ index 061f884..f0495dd 100644
      const record = id === undefined ? undefined : this.peers.get(id)
      return record === undefined ? { rejection: 401 } : { peer: record.peer }
    }
-@@ -146,9 +149,26 @@ export class HostConnectionService extends Service implements HostConnectionHand
+@@ -146,9 +149,22 @@ export class HostConnectionService extends Service implements HostConnectionHand
      }
    }
  
@@ -1126,8 +1140,7 @@ index 061f884..f0495dd 100644
 +   * origin replaces the loopback Host only when the proxy headers match it.
 +   */
 +  private trustContext(request: ConnectionTrustRequest): RequestTrustView {
-     const carrier = this.owner.get('webServer')
--    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
++    const carrier = this.owner.get('webServer')
 +    return requestTrustView(request, {
 +      ...this.publicOrigin !== undefined ? { publicOrigin: this.publicOrigin } : {},
 +      trustedHosts: this.trustedHosts,
@@ -1136,16 +1149,13 @@ index 061f884..f0495dd 100644
 +  }
 +
 +  private viewIsTrusted(view: RequestTrustView): boolean {
-+    const carrier = this.owner.get('webServer')
+     const carrier = this.owner.get('webServer')
+-    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
 +    return isTrustedApiRequest({ headers: view.headers }, view.trustedHosts, carrier?.host, view.protocol)
-+  }
-+
-+  private isTrusted(request: ConnectionTrustRequest): boolean {
-+    return this.viewIsTrusted(this.trustContext(request))
    }
  
    private publishPeer(interactions: ConnectionInteractions): PeerId {
-@@ -163,20 +183,30 @@ export class HostConnectionService extends Service implements HostConnectionHand
+@@ -163,20 +179,30 @@ export class HostConnectionService extends Service implements HostConnectionHand
     * @param response - response owned to completion.
     */
    authorizeConnect(request: ConnectionIndexRequest, response: ConnectionIndexResponse): void {
