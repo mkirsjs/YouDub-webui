@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .audio_segments import SpeechClip, SpeechClips
+from .cue_groups import group_segments, resolve_speaker_scope, unknown_blocks, write_span_reference
 from .audio import audio_info
 from .errors import ApiError
 from .segments import LANGUAGES, Transcript, read_transcript, read_translation
@@ -81,7 +82,7 @@ def prepare_reference_audio(context: StageContext, transcript: Transcript, progr
 
 
 def run(context: StageContext, progress: Callable[[float | None, str], None], *,
-        prepared_references: dict) -> Completed:
+        prepared_references: dict, task_root: Path | None = None) -> Completed:
     from .media import _run_media
 
     context.check_cancel()
@@ -112,20 +113,59 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
         raise _reference_error("Prepared source references must match transcript utterance IDs exactly.")
     output_dir = context.work_dir / "tts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    clips = [{"segment_id": segment.id, "text": texts[segment.id],
-              "reference_path": str(Path(prepared[segment.id]["path"]).resolve()),
-              "reference_text": prepared[segment.id]["text"],
-              "output_path": str((output_dir / f"{index:06d}.wav").resolve())}
-             for index, segment in enumerate(transcript.segments, start=1)]
+    grouping = bool(getattr(selection, "group_cues", False))
+    speaker_scope = resolve_speaker_scope(selection)
+    phrases = group_segments(transcript.segments, texts, enabled=grouping, speaker_scope=speaker_scope)
+    (output_dir / "grouping.json").write_text(json.dumps({
+        "group_cues": grouping,
+        "speaker_scope": speaker_scope,
+        "diarization": False,
+        "phrases": [list(phrase.member_ids) for phrase in phrases],
+        "unknown_not_joined": unknown_blocks(transcript.segments, speaker_scope=speaker_scope) if grouping else [],
+        "note": "No speaker model is loaded. Unlabeled cues stay separate unless speaker scope is single.",
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    group_dir = output_dir / "phrase-references"
+    clips = []
+    for index, phrase in enumerate(phrases, start=1):
+        members = [segment for segment in transcript.segments if segment.id in phrase.member_ids]
+        reference_path = Path(prepared[phrase.segment_id]["path"]).resolve()
+        if len(phrase.member_ids) > 1:
+            group_dir.mkdir(parents=True, exist_ok=True)
+            reference_path = (group_dir / f"{index:06d}.wav").resolve()
+            write_span_reference(members, prepared, reference_path)
+        clips.append({
+            "segment_id": phrase.segment_id,
+            "text": phrase.translation_text,
+            "reference_path": str(reference_path),
+            "reference_text": phrase.reference_text,
+            "output_path": str((output_dir / f"{index:06d}.wav").resolve()),
+            **({"member_ids": list(phrase.member_ids), "speaker_scope": speaker_scope} if grouping else {}),
+        })
     request_path = output_dir / "request.json"
     request_path.write_text(json.dumps({"clips": clips}, ensure_ascii=False, indent=2), encoding="utf-8")
+    progress_path = output_dir / "progress.json"
+    seen = {"message": None}
+
+    def poll() -> None:
+        try:
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            return
+        message = payload.get("message")
+        if not isinstance(message, str) or not message or message == seen["message"]:
+            return
+        seen["message"] = message
+        index, total = payload.get("index"), payload.get("total")
+        value = index / total if isinstance(index, int) and isinstance(total, int) and total > 0 and index >= 0 else None
+        progress(value, message)
+
+    command = [sys.executable, str(Path(__file__).with_name("tts_process.py")),
+               "--model-path", str(model_directory().resolve()), "--request-path", str(request_path.resolve()),
+               "--device", selection.device]
+    if task_root is not None:
+        command.extend(["--task-root", str(task_root.resolve())])
     progress(None, "Generating translated speech with VoxCPM2")
-    result = _run_media(
-        [sys.executable, str(Path(__file__).with_name("tts_process.py")),
-         "--model-path", str(model_directory().resolve()), "--request-path", str(request_path.resolve()),
-         "--device", selection.device],
-        check_cancel=context.check_cancel,
-    )
+    result = _run_media(command, check_cancel=context.check_cancel, poll=poll)
     if result.returncode != 0:
         try:
             error = json.loads(result.stderr.strip().splitlines()[-1])
@@ -145,8 +185,11 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
         duration_ms = round(info.frames * 1000 / info.samplerate)
         if duration_ms <= 0:
             raise ApiError(502, "INVALID_PROVIDER_RESULT", "A generated speech clip has no measurable duration.", stage="tts")
-        measured.append(SpeechClip(segment_id=clip["segment_id"], path=path.relative_to(context.work_dir.resolve()).as_posix(),
-                                   duration_ms=duration_ms, sample_rate_hz=info.samplerate, channels=info.channels))
+        measured.append(SpeechClip(
+            segment_id=clip["segment_id"], path=path.relative_to(context.work_dir.resolve()).as_posix(),
+            duration_ms=duration_ms, sample_rate_hz=info.samplerate, channels=info.channels,
+            **({"member_ids": clip["member_ids"]} if clip.get("member_ids") else {}),
+        ))
     payload = SpeechClips(clips=measured)
     payload.match(transcript)
     output = context.work_dir / "speech_clips.json"

@@ -1,0 +1,505 @@
+diff --git a/artifacts/phrase-seam-deploy.md b/artifacts/phrase-seam-deploy.md
+index b83f04a..3b47794 100644
+--- a/artifacts/phrase-seam-deploy.md
++++ b/artifacts/phrase-seam-deploy.md
+@@ -22,7 +22,7 @@ python -m backend.app.v1.seam_compare \
+ 
+ The author has no dubbing grouping step. Subtitle punctuation splitting is display-only. Whisper tiny does not set `speaker_id`.
+ 
+-`groupCues` defaults off, so an old saved graph stays one cue per clone. The built-in「视频配音」template sets it on for a new task. Two cues join only when the gap is at most 300 ms, the span stays within 12 seconds, and the previous cue does not end a sentence. Different known speakers never join. If either cue has a speaker id and the other does not, they do not join. If neither has a speaker id, the join uses only the pause, punctuation, and length rules. That is not a claim that the speakers are the same.
++`groupCues` defaults off, so an old saved graph stays one cue per clone. The built-in「视频配音」template turns grouping on and sets `speakerScope` to `unknown`. Unlabeled cues do not join. See `artifacts/speaker-scope-deploy.md`. Two cues join only when the gap is at most 300 ms, the span stays within 12 seconds, and the previous cue does not end a sentence. Different known speakers never join. The same known speaker may join. Unlabeled cues join only when the user sets `speakerScope` to `single`.
+ 
+ The English prompt is the joined source text. The Chinese line is the joined translation. The reference wav is the span from the first cue start through the last cue end, including a short internal pause. It is not a fixed trim of every cue. A receipt without the same `member_ids` is not reused.
+ 
+diff --git a/artifacts/speaker-scope-deploy.md b/artifacts/speaker-scope-deploy.md
+new file mode 100644
+index 0000000..12e45bb
+--- /dev/null
++++ b/artifacts/speaker-scope-deploy.md
+@@ -0,0 +1,33 @@
++# Speaker scope for phrase grouping
++
++Apply this after `17e43453b678a423fa0baacb6d9eb60d53f2e2cb`. Do not replace or reorder the silence, Index, upload, or phrase-seam patches.
++
++Whisper tiny does not label speakers. Grouping no longer treats two unlabeled cues as one person. The「视频配音」template still shows short-cue grouping, with **说话人范围** set to **未知说话人：不跨句合并**. That choice is on the synthesize card. It does not enable speaker detection and it does not download a speaker model.
++
++| 说话人范围 | Unlabeled cues | Same known speaker | Different speakers |
++|---|---|---|---|
++| `unknown` (default) | stay separate | may join | never join |
++| `multi` | stay separate; the label says there is no speaker detection | may join | never join |
++| `single` | may join after the user confirms the whole source is one person | may join | never join |
++
++A saved graph that only has `groupCues: true` from the previous patch also stays on `unknown`, because a missing scope is not treated as single. Joining still stops at 300 ms, 12 seconds, or a sentence ending. One side labeled and the other unlabeled never join.
++
++`tts/grouping.json` lists the phrases and `unknown_not_joined`. A receipt from another scope or another member list is not reused.
++
++## Short-sample A/B, no video and no model
++
++```sh
++python -m backend.app.v1.cue_groups
++```
++
++`per_cue` is one cue per clone. `single_speaker` joins the unlabeled question pair. `unknown` and `multi` leave that pair split and still join the two lines that already share a speaker id. The sample is in `backend/app/v1/cue_groups.py` (`SHORT_SAMPLE`). It is not task `9280e54b` or `59a78441`.
++
++## Apply
++
++```sh
++git apply --check artifacts/youdub-speaker-scope-since-17e4345.patch
++git apply artifacts/youdub-speaker-scope-since-17e4345.patch
++npm --prefix apps/harness run build
++```
++
++Restart `youdub-host` only when no task is running. The rebuild is what shows the new labels. The worker default already refuses unlabeled joins before that rebuild.
+diff --git a/backend/app/v1/contracts.py b/backend/app/v1/contracts.py
+index f9dc1d9..ee517d2 100644
+--- a/backend/app/v1/contracts.py
++++ b/backend/app/v1/contracts.py
+@@ -37,6 +37,7 @@ VoiceSelection = Annotated[PresetVoice | SourceCloneVoice, Field(discriminator="
+ class TtsSelection(ModelSelection):
+     voice: VoiceSelection
+     group_cues: bool = False
++    speaker_scope: Literal["unknown", "single", "multi"] = "unknown"
+ 
+ 
+ class TaskConfig(Contract):
+diff --git a/backend/app/v1/cue_groups.py b/backend/app/v1/cue_groups.py
+index a5de409..1999990 100644
+--- a/backend/app/v1/cue_groups.py
++++ b/backend/app/v1/cue_groups.py
+@@ -1,13 +1,15 @@
+ """Group short subtitle cues into one source-clone phrase.
+ 
+-Whisper tiny does not identify speakers. A missing speaker id is not treated as
+-one speaker. Known different speakers are never joined. A join also stops at a
+-sentence ending, a pause longer than 300 ms, or a 12 second span. The reference
+-interval is the untouched span from the first cue start to the last cue end.
++Whisper tiny does not identify speakers. Missing speaker ids stay separate
++unless the user sets speaker scope to ``single``. The same known speaker may
++join. Different speakers never join. A join also stops at a sentence ending,
++a pause longer than 300 ms, or a 12 second span.
+ """
+ 
+ from __future__ import annotations
+ 
++import json
++import sys
+ from dataclasses import dataclass
+ 
+ import numpy as np
+@@ -16,6 +18,24 @@ import soundfile as sf
+ MAX_GAP_MS = 300
+ MAX_SPAN_MS = 12_000
+ SENTENCE_END = set(".?!。！？")
++SCOPES = ("unknown", "single", "multi")
++
++# Short sample shared by the boundary tests and `python -m backend.app.v1.cue_groups`.
++# It is not a finished video and it does not call a model.
++SHORT_SAMPLE = {
++    "segments": [
++        {"id": "q1", "start_ms": 0, "end_ms": 700, "text": "What happened,", "speaker_id": None},
++        {"id": "q2", "start_ms": 800, "end_ms": 1400, "text": "exactly?", "speaker_id": None},
++        {"id": "a1", "start_ms": 1800, "end_ms": 2400, "text": "I waited,", "speaker_id": "guest"},
++        {"id": "a2", "start_ms": 2500, "end_ms": 3100, "text": "then I left.", "speaker_id": "guest"},
++        {"id": "h1", "start_ms": 3400, "end_ms": 3900, "text": "Thanks,", "speaker_id": "host"},
++        {"id": "h2", "start_ms": 4000, "end_ms": 4500, "text": "next question.", "speaker_id": "host"},
++    ],
++    "translations": {
++        "q1": "发生了什么，", "q2": "具体呢？", "a1": "我等了，", "a2": "然后离开了。",
++        "h1": "谢谢，", "h2": "下一个问题。",
++    },
++}
+ 
+ 
+ @dataclass(frozen=True)
+@@ -32,6 +52,15 @@ class Phrase:
+         return self.member_ids[0]
+ 
+ 
++def resolve_speaker_scope(selection) -> str:
++    """Unknown stays conservative. ``singleSpeaker`` confirms one person only."""
++    raw = getattr(selection, "speaker_scope", None) or "unknown"
++    scope = raw if raw in SCOPES else "unknown"
++    if scope == "unknown" and bool(getattr(selection, "single_speaker", False)):
++        return "single"
++    return scope
++
++
+ def _ends_sentence(text: str) -> bool:
+     stripped = text.rstrip()
+     return bool(stripped) and stripped[-1] in SENTENCE_END
+@@ -49,25 +78,31 @@ def _join(parts: list[str]) -> str:
+     return joined
+ 
+ 
+-def _can_append(current, segment) -> bool:
++def _timing_allows(current, segment) -> bool:
+     previous = current[-1]
+     gap = segment.start_ms - previous.end_ms
+     span = segment.end_ms - current[0].start_ms
+-    if gap < 0 or gap > MAX_GAP_MS or span > MAX_SPAN_MS or _ends_sentence(previous.text):
++    return gap >= 0 and gap <= MAX_GAP_MS and span <= MAX_SPAN_MS and not _ends_sentence(previous.text)
++
++
++def _can_append(current, segment, *, allow_unknown: bool) -> bool:
++    if not _timing_allows(current, segment):
+         return False
+-    left = getattr(previous, "speaker_id", None)
++    left = getattr(current[-1], "speaker_id", None)
+     right = getattr(segment, "speaker_id", None)
+     if left and right:
+         return left == right
+     if left or right:
+         return False
+-    return True
++    return allow_unknown
+ 
+ 
+-def group_segments(segments, translations: dict[str, str], *, enabled: bool) -> list[Phrase]:
++def group_segments(segments, translations: dict[str, str], *, enabled: bool, speaker_scope: str = "unknown") -> list[Phrase]:
+     """Return one phrase per cue, or merged phrases when ``enabled`` is true."""
+     if not segments:
+         return []
++    scope = speaker_scope if speaker_scope in SCOPES else "unknown"
++    allow_unknown = bool(enabled) and scope == "single"
+ 
+     def phrase(members) -> Phrase:
+         return Phrase(
+@@ -83,13 +118,48 @@ def group_segments(segments, translations: dict[str, str], *, enabled: bool) ->
+         return [phrase([item]) for item in segments]
+     groups: list[list] = [[segments[0]]]
+     for segment in segments[1:]:
+-        if _can_append(groups[-1], segment):
++        if _can_append(groups[-1], segment, allow_unknown=allow_unknown):
+             groups[-1].append(segment)
+         else:
+             groups.append([segment])
+     return [phrase(members) for members in groups]
+ 
+ 
++def unknown_blocks(segments, *, speaker_scope: str = "unknown") -> list[list[str]]:
++    """Adjacent cues that timing would join, but unlabeled speakers keep apart."""
++    if speaker_scope == "single":
++        return []
++    blocked = []
++    current = [segments[0]] if segments else []
++    for segment in segments[1:]:
++        previous = current[-1]
++        left = getattr(previous, "speaker_id", None)
++        right = getattr(segment, "speaker_id", None)
++        if _timing_allows(current, segment) and not left and not right:
++            blocked.append([previous.id, segment.id])
++            current.append(segment)
++            continue
++        current = [segment]
++    return blocked
++
++
++def plans(segments, translations: dict[str, str]) -> dict:
++    """Reproducible A/B membership without reading audio or calling a model."""
++    per_cue = group_segments(segments, translations, enabled=False)
++    single = group_segments(segments, translations, enabled=True, speaker_scope="single")
++    unknown = group_segments(segments, translations, enabled=True, speaker_scope="unknown")
++    multi = group_segments(segments, translations, enabled=True, speaker_scope="multi")
++    return {
++        "diarization": False,
++        "per_cue": [list(item.member_ids) for item in per_cue],
++        "single_speaker": [list(item.member_ids) for item in single],
++        "unknown": [list(item.member_ids) for item in unknown],
++        "multi": [list(item.member_ids) for item in multi],
++        "unknown_not_joined": unknown_blocks(segments, speaker_scope="unknown"),
++        "note": "Whisper tiny has no speaker ids. unknown and multi do not join those cues. single joins them only after the user confirms one speaker. Same known ids can join. Different ids never join.",
++    }
++
++
+ def write_span_reference(members, references: dict, destination) -> None:
+     """Write the vocals span covering every member, including short internal pauses."""
+     pieces = []
+@@ -109,3 +179,19 @@ def write_span_reference(members, references: dict, destination) -> None:
+         pieces.append(np.asarray(samples, dtype=np.float32))
+     audio = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float32)
+     sf.write(destination, audio, rate or 16000, subtype="PCM_16")
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = list(sys.argv[1:] if argv is None else argv)
++    payload = SHORT_SAMPLE
++    if args:
++        payload = json.loads(open(args[0], encoding="utf-8").read())
++    segments = []
++    for item in payload["segments"]:
++        segments.append(type("Cue", (), item))
++    print(json.dumps(plans(segments, payload["translations"]), ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/backend/app/v1/tts.py b/backend/app/v1/tts.py
+index c19e014..1e970fa 100644
+--- a/backend/app/v1/tts.py
++++ b/backend/app/v1/tts.py
+@@ -9,7 +9,7 @@ from collections.abc import Callable
+ from pathlib import Path
+ 
+ from .audio_segments import SpeechClip, SpeechClips
+-from .cue_groups import group_segments, write_span_reference
++from .cue_groups import group_segments, resolve_speaker_scope, unknown_blocks, write_span_reference
+ from .audio import audio_info
+ from .errors import ApiError
+ from .segments import LANGUAGES, Transcript, read_transcript, read_translation
+@@ -113,7 +113,17 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
+         raise _reference_error("Prepared source references must match transcript utterance IDs exactly.")
+     output_dir = context.work_dir / "tts"
+     output_dir.mkdir(parents=True, exist_ok=True)
+-    phrases = group_segments(transcript.segments, texts, enabled=bool(getattr(selection, "group_cues", False)))
++    grouping = bool(getattr(selection, "group_cues", False))
++    speaker_scope = resolve_speaker_scope(selection)
++    phrases = group_segments(transcript.segments, texts, enabled=grouping, speaker_scope=speaker_scope)
++    (output_dir / "grouping.json").write_text(json.dumps({
++        "group_cues": grouping,
++        "speaker_scope": speaker_scope,
++        "diarization": False,
++        "phrases": [list(phrase.member_ids) for phrase in phrases],
++        "unknown_not_joined": unknown_blocks(transcript.segments, speaker_scope=speaker_scope) if grouping else [],
++        "note": "No speaker model is loaded. Unlabeled cues stay separate unless speaker scope is single.",
++    }, ensure_ascii=False, indent=2), encoding="utf-8")
+     group_dir = output_dir / "phrase-references"
+     clips = []
+     for index, phrase in enumerate(phrases, start=1):
+@@ -129,7 +139,7 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
+             "reference_path": str(reference_path),
+             "reference_text": phrase.reference_text,
+             "output_path": str((output_dir / f"{index:06d}.wav").resolve()),
+-            **({"member_ids": list(phrase.member_ids)} if getattr(selection, "group_cues", False) else {}),
++            **({"member_ids": list(phrase.member_ids), "speaker_scope": speaker_scope} if grouping else {}),
+         })
+     request_path = output_dir / "request.json"
+     request_path.write_text(json.dumps({"clips": clips}, ensure_ascii=False, indent=2), encoding="utf-8")
+diff --git a/backend/app/v1/tts_process.py b/backend/app/v1/tts_process.py
+index 557269d..a248dea 100644
+--- a/backend/app/v1/tts_process.py
++++ b/backend/app/v1/tts_process.py
+@@ -123,6 +123,8 @@ def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path, ord
+         return False
+     if clip.get("member_ids") and receipt.get("member_ids") != clip["member_ids"]:
+         return False
++    if clip.get("speaker_scope") and receipt.get("speaker_scope") != clip["speaker_scope"]:
++        return False
+     if receipt.get("model_path") != str(model_path):
+         return False
+     try:
+@@ -156,6 +158,7 @@ def _write_receipt(
+         "legacy": legacy,
+         "request_sha256": request_sha256,
+         **({"member_ids": clip["member_ids"]} if clip.get("member_ids") else {}),
++        **({"speaker_scope": clip["speaker_scope"]} if clip.get("speaker_scope") else {}),
+     }
+     path = _receipt_path(wav)
+     temporary = path.with_suffix(".json.partial")
+diff --git a/backend/tests/test_cue_groups.py b/backend/tests/test_cue_groups.py
+index 9014535..e70a8a0 100644
+--- a/backend/tests/test_cue_groups.py
++++ b/backend/tests/test_cue_groups.py
+@@ -6,7 +6,7 @@ from types import SimpleNamespace
+ import numpy as np
+ import soundfile as sf
+ 
+-from backend.app.v1.cue_groups import group_segments, write_span_reference
++from backend.app.v1.cue_groups import SHORT_SAMPLE, group_segments, plans, resolve_speaker_scope, unknown_blocks, write_span_reference
+ from backend.app.v1.tts_process import _content_matches, _write_receipt
+ 
+ 
+@@ -14,36 +14,77 @@ def _cue(identifier, start, end, text, speaker=None):
+     return SimpleNamespace(id=identifier, start_ms=start, end_ms=end, text=text, speaker_id=speaker)
+ 
+ 
+-def test_unknown_speakers_join_only_across_a_short_pause_and_keep_every_word():
++def _ids(segments, **kwargs):
++    translations = {item.id: item.text for item in segments}
++    return [item.member_ids for item in group_segments(segments, translations, **kwargs)]
++
++
++def test_unlabeled_cues_stay_separate_until_the_user_confirms_one_speaker():
+     cues = [
+         _cue("a", 0, 800, "Hello,"),
+         _cue("b", 900, 1600, "there."),
+         _cue("c", 2500, 3200, "Next line."),
+     ]
+     translations = {"a": "你好，", "b": "那里。", "c": "下一句。"}
+-    separate = group_segments(cues, translations, enabled=False)
+-    grouped = group_segments(cues, translations, enabled=True)
++    separate = group_segments(cues, translations, enabled=False, speaker_scope="single")
++    unknown = group_segments(cues, translations, enabled=True, speaker_scope="unknown")
++    multi = group_segments(cues, translations, enabled=True, speaker_scope="multi")
++    single = group_segments(cues, translations, enabled=True, speaker_scope="single")
+     assert [item.member_ids for item in separate] == [("a",), ("b",), ("c",)]
+-    assert [item.member_ids for item in grouped] == [("a", "b"), ("c",)]
+-    assert grouped[0].reference_text == "Hello, there."
+-    assert grouped[0].translation_text == "你好， 那里。"
+-    assert grouped[0].start_ms == 0 and grouped[0].end_ms == 1600
+-    assert grouped[0].speaker_known is False
+-    assert "Hello," in grouped[0].reference_text and "there." in grouped[0].reference_text
+-    assert "你好，" in grouped[0].translation_text and "那里。" in grouped[0].translation_text
++    assert [item.member_ids for item in unknown] == [("a",), ("b",), ("c",)]
++    assert [item.member_ids for item in multi] == [("a",), ("b",), ("c",)]
++    assert [item.member_ids for item in single] == [("a", "b"), ("c",)]
++    assert unknown_blocks(cues, speaker_scope="unknown") == [["a", "b"]]
++    assert unknown_blocks(cues, speaker_scope="multi") == [["a", "b"]]
++    assert unknown_blocks(cues, speaker_scope="single") == []
++    assert single[0].reference_text == "Hello, there."
++    assert single[0].translation_text == "你好， 那里。"
++    assert single[0].speaker_known is False
+ 
+ 
+-def test_known_speakers_do_not_cross_and_a_long_pause_stays_split():
++def test_known_speakers_join_without_single_mode_and_different_speakers_never_join():
+     cues = [
+         _cue("a", 0, 500, "One,", "s1"),
+         _cue("b", 600, 1000, "two.", "s2"),
+         _cue("c", 1100, 1500, "same,", "s1"),
+         _cue("d", 1600, 2000, "speaker.", "s1"),
++        _cue("e", 2100, 2500, "unknown,", None),
+     ]
+-    translations = {item.id: item.text for item in cues}
+-    groups = group_segments(cues, translations, enabled=True)
+-    assert [item.member_ids for item in groups] == [("a",), ("b",), ("c", "d")]
+-    assert groups[-1].speaker_known is True
++    for scope in ("unknown", "single", "multi"):
++        groups = _ids(cues, enabled=True, speaker_scope=scope)
++        assert ("a",) in groups and ("b",) in groups
++        assert ("c", "d") in groups
++        assert ("d", "e") not in groups and ("c", "d", "e") not in groups
++    assert _ids(cues, enabled=True, speaker_scope="single")[-1] == ("e",)
++
++
++def test_timing_boundaries_and_a_missing_label_on_one_side():
++    gap_ok = [_cue("a", 0, 500, "Hello,"), _cue("b", 800, 1200, "there")]
++    gap_over = [_cue("a", 0, 500, "Hello,"), _cue("b", 801, 1200, "there")]
++    span_ok = [_cue("a", 0, 500, "Hello,"), _cue("b", 600, 12_000, "there")]
++    span_over = [_cue("a", 0, 500, "Hello,"), _cue("b", 600, 12_001, "there")]
++    sentence = [_cue("a", 0, 500, "Hello."), _cue("b", 600, 1000, "Next")]
++    mixed = [_cue("a", 0, 500, "Hello,", "s1"), _cue("b", 600, 1000, "there")]
++    assert _ids(gap_ok, enabled=True, speaker_scope="single") == [("a", "b")]
++    assert _ids(gap_over, enabled=True, speaker_scope="single") == [("a",), ("b",)]
++    assert _ids(span_ok, enabled=True, speaker_scope="single") == [("a", "b")]
++    assert _ids(span_over, enabled=True, speaker_scope="single") == [("a",), ("b",)]
++    assert _ids(sentence, enabled=True, speaker_scope="single") == [("a",), ("b",)]
++    assert _ids(mixed, enabled=True, speaker_scope="single") == [("a",), ("b",)]
++    assert _ids(gap_ok, enabled=True, speaker_scope="unknown") == [("a",), ("b",)]
++
++
++def test_short_sample_reproduces_per_cue_and_single_speaker_plans():
++    segments = [SimpleNamespace(**item) for item in SHORT_SAMPLE["segments"]]
++    result = plans(segments, SHORT_SAMPLE["translations"])
++    assert result["diarization"] is False
++    assert result["per_cue"] == [["q1"], ["q2"], ["a1"], ["a2"], ["h1"], ["h2"]]
++    assert result["unknown"] == result["multi"] == [["q1"], ["q2"], ["a1", "a2"], ["h1", "h2"]]
++    assert result["single_speaker"] == [["q1", "q2"], ["a1", "a2"], ["h1", "h2"]]
++    assert result["unknown_not_joined"] == [["q1", "q2"]]
++    assert resolve_speaker_scope(SimpleNamespace(speaker_scope="unknown", single_speaker=True)) == "single"
++    assert resolve_speaker_scope(SimpleNamespace(speaker_scope="multi", single_speaker=True)) == "multi"
++    assert resolve_speaker_scope(SimpleNamespace(speaker_scope="nope")) == "unknown"
+ 
+ 
+ def test_span_reference_keeps_the_internal_pause_and_old_receipt_does_not_match(tmp_path):
+@@ -61,7 +102,13 @@ def test_span_reference_keeps_the_internal_pause_and_old_receipt_does_not_match(
+     wav = tmp_path / "000001.wav"
+     sf.write(wav, np.full(rate, 0.2), rate)
+     clip = {"segment_id": "a", "text": "你好， 那里。", "reference_text": "Hello, there.",
+-            "reference_path": str(destination), "member_ids": ["a", "b"]}
++            "reference_path": str(destination), "member_ids": ["a", "b"], "speaker_scope": "single"}
+     _write_receipt(wav, {"segment_id": "a", "text": "你好，", "reference_text": "Hello,",
+                          "reference_path": str(first)}, model, None, legacy=True, ordinal=1)
+-    assert _content_matches(json.loads((wav.parent / "000001.wav.receipt.json").read_text()), clip, model, wav, 1) is False
++    receipt = json.loads((wav.parent / "000001.wav.receipt.json").read_text())
++    assert _content_matches(receipt, clip, model, wav, 1) is False
++    same = {"segment_id": "a", "text": "你好，", "reference_text": "Hello,", "reference_path": str(first),
++            "member_ids": ["a"], "speaker_scope": "unknown"}
++    _write_receipt(wav, same, model, None, legacy=False, ordinal=1)
++    changed_scope = {**same, "speaker_scope": "single"}
++    assert _content_matches(json.loads((wav.parent / "000001.wav.receipt.json").read_text()), changed_scope, model, wav, 1) is False
+diff --git a/backend/workers/operations.py b/backend/workers/operations.py
+index 9a71d8b..ee49012 100644
+--- a/backend/workers/operations.py
++++ b/backend/workers/operations.py
+@@ -74,6 +74,8 @@ class Operation:
+             if name == "tts":
+                 values["voice"] = SimpleNamespace(**self.option("voice", default=values.get("voice") or {"mode": "source_clone"}))
+                 values["group_cues"] = bool(self.option("groupCues", "group_cues", False))
++                values["speaker_scope"] = self.option("speakerScope", "speaker_scope", "unknown")
++                values["single_speaker"] = bool(self.option("singleSpeaker", "single_speaker", False))
+             return SimpleNamespace(**values)
+         # Build only this operation's parameters. Historical task aliases remain
+         # accepted by option(); unrelated model selections never enter the stage.
+diff --git a/packages/builtin/src/node-contracts.ts b/packages/builtin/src/node-contracts.ts
+index 7ef5c5e..66ec960 100644
+--- a/packages/builtin/src/node-contracts.ts
++++ b/packages/builtin/src/node-contracts.ts
+@@ -34,7 +34,30 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
+ }
+ 
+ 
+-nodeDescriptors.synthesize.ui = { quickFields: ['targetLanguage', 'groupCues'], editorId: 'youdub.synthesize' }
++nodeDescriptors.synthesize.configSchema.properties.speakerScope = {
++  type: 'string', enum: ['unknown', 'single', 'multi'],
++  'x-options': [
++    { value: 'unknown', label: { default: 'Unknown speakers: do not join cues', translations: { zh: '未知说话人：不跨句合并', ja: '話者不明：文をまたいで結合しない' } } },
++    { value: 'single', label: { default: 'I confirm one speaker: short cues may join', translations: { zh: '我确认整段只有一个人：短句可以合并', ja: '一人だけと確認：短い文は結合できる' } } },
++    { value: 'multi', label: { default: 'Several people: unlabeled cues stay separate, no speaker detection', translations: { zh: '可能多人：没有说话人识别，未标记的句子各自配音', ja: '複数人の可能性：話者検出はなく、未標記の文は別々' } } },
++  ],
++  description: {
++    default: 'Whisper tiny does not label speakers, and this control does not turn speaker detection on. Unknown and multi never join unlabeled cues, so a fast exchange is not cloned as one voice. Choose single only when the whole source is one person. Matching speaker ids can still join. Different ids never join. No speaker model is downloaded.',
++    translations: {
++      zh: 'Whisper tiny 不标说话人，这个选项也不会打开说话人识别。默认「未知」不把相邻句合成同一参考，避免采访里快速换人被克隆成同一个人。只有确认整段只有一个人时才选「单人」。选择「可能多人」时，没有标记的句子各自配音。已经标成同一人的短句可以合并，不同的人不会合并。不会下载说话人模型。',
++      ja: 'Whisper tiny は話者を付けません。この設定は話者検出を有効にしません。既定の「不明」では隣接する文を一つの参照にまとめず、会話の入れ替わりを一人の声にしません。「一人」はソース全体が一人だと確認したときだけです。「複数人」では未標記の文を別々に残します。同じ話者IDだけ結合し、違う話者は結合しません。話者モデルは追加しません。',
++    },
++  },
++}
++nodeDescriptors.synthesize.configSchema.properties.groupCues.description = {
++  default: 'Short cues can share one cloned phrase. With no speaker labels this stays off until Speaker scope is single. It does not detect who is speaking.',
++  translations: {
++    zh: '短字幕可以合成一段再配音。没有说话人标记时，说话人范围仍是「未知」或「可能多人」就不会跨句合并。这不是说话人识别。',
++    ja: '短い字幕を一つの吹き替えにまとめられます。話者ラベルがないとき、話者範囲が「不明」または「複数人」なら文をまたいで結合しません。話者検出ではありません。',
++  },
++}
++nodeDescriptors.synthesize.defaults.speakerScope = 'unknown'
++nodeDescriptors.synthesize.ui = { quickFields: ['speakerScope', 'groupCues', 'targetLanguage'], editorId: 'youdub.synthesize' }
+ nodeDescriptors.export.ui = { quickFields: ['targetLanguage'] }
+ for (const [operation, title] of Object.entries({ synthesize: ['Dubbing language', '配音语言', '吹き替えの言語'], align: ['Alignment language', '对齐语言', '整列の言語'], export: ['Export language', '导出语言', '書き出しの言語'] })) {
+   const properties = nodeDescriptors[operation].configSchema.properties
+@@ -56,7 +79,7 @@ const fieldTitles: Record<string, [string, string, string]> = {
+   sourceLanguage: ['原文语言', 'Source language', '元の言語'], targetLanguage: ['目标语言', 'Target language', '翻訳先の言語'],
+   initialPrompt: ['识别提示词', 'Recognition prompt', '認識プロンプト'],
+   proxyPort: ['本机 HTTP 代理端口（0 为直连）', 'Local HTTP proxy port (0 for direct)', 'ローカル HTTP プロキシポート（0 は直接接続）'],
+-  voice: ['声音', 'Voice', '音声'], groupCues: ['按语段合并短字幕后再配音', 'Group short cues into phrases before dubbing', '短い字幕を文単位にまとめてから吹き替える'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
++  voice: ['声音', 'Voice', '音声'], speakerScope: ['说话人范围', 'Speaker scope', '話者の範囲'], groupCues: ['短句合并', 'Group short cues', '短い文をまとめる'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
+   renderSubtitles: ['烧录字幕', 'Burn subtitles', '字幕を焼き込む'], url: ['视频链接', 'Video URL', '動画リンク'],
+ }
+ for (const descriptor of Object.values(nodeDescriptors)) for (const schema of [descriptor.configSchema, descriptor.runtimeInputSchema]) {
+diff --git a/packages/builtin/src/workflow-templates/source-clone-dubbing.json b/packages/builtin/src/workflow-templates/source-clone-dubbing.json
+index f542cc7..f53d3c3 100644
+--- a/packages/builtin/src/workflow-templates/source-clone-dubbing.json
++++ b/packages/builtin/src/workflow-templates/source-clone-dubbing.json
+@@ -52,7 +52,7 @@
+       "type": "youdub.synthesize",
+       "typeVersion": "1.0.0",
+       "provider": { "id": "voxcpm", "model": "VoxCPM2", "device": "auto" },
+-      "config": { "targetLanguage": "zh", "groupCues": true, "voice": { "mode": "source_clone" } },
++      "config": { "targetLanguage": "zh", "groupCues": true, "speakerScope": "unknown", "voice": { "mode": "source_clone" } },
+       "autoContinue": true
+     },
+     {
+diff --git a/packages/builtin/test/workflow-graph.test.ts b/packages/builtin/test/workflow-graph.test.ts
+index 8bc71e3..f21731d 100644
+--- a/packages/builtin/test/workflow-graph.test.ts
++++ b/packages/builtin/test/workflow-graph.test.ts
+@@ -46,6 +46,9 @@ test('independent templates compile without mutating graph and only freeze selec
+   assert.ok(plans[0].steps.every(step => !['synthesize', 'separate', 'reference', 'mix'].includes(step.id)))
+   assert.deepEqual(templates.map(item => item.id), ['youdub.subtitles', 'youdub.dubbing', 'youdub.subtitles-dubbing'])
+   assert.equal(plans[1].bindings.export.options.outputMode, 'dubbing')
++  assert.equal(plans[1].bindings.synthesize.options.groupCues, true)
++  assert.equal(plans[1].bindings.synthesize.options.speakerScope, 'unknown')
++  assert.equal(plans[1].bindings.synthesize.options.groupCues === true && plans[1].bindings.synthesize.options.speakerScope !== 'single', true)
+   assert.equal(plans[2].bindings.export.options.outputMode, 'both')
+   const reviewed = structuredClone(templates[0].document)
+   reviewed.nodes.find(node => node.id === 'recognize')!.autoContinue = false

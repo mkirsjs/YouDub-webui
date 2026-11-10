@@ -1,0 +1,7 @@
+# Index-Translate-2B runtime, installed into a venv created from the YouDub
+# interpreter with --system-site-packages so torch 2.8+cu126 is reused.
+# Do not install vllm or a second CUDA torch wheel.
+transformers==5.6.2
+huggingface-hub==1.5.0
+tokenizers==0.22.2
+safetensors==0.7.0

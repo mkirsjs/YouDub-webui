@@ -33,6 +33,8 @@
       name: '@deepseek-ai/dsh-credentials-local'
     - id: llm-pi-ai
       name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers: !!js '(() => { const named = ["YOUDUB_TRANSLATION_BASE_URL", "YOUDUB_TRANSLATION_MODEL", "YOUDUB_TRANSLATION_MODEL_DIR", "YOUDUB_TRANSLATION_SERVER_COMMAND"].some(name => (process.env[name] || "").trim()); if (!named) return {}; const root = (process.env.YOUDUB_MEDIA_ROOT || "").trim(); if (!root) throw new Error("YOUDUB_MEDIA_ROOT is required when local translation is configured"); const fs = process.getBuiltinModule("node:fs"); const candidates = [process.cwd() + "/youdub-plugin/dist/local-translation.cjs", process.cwd() + "/node_modules/@youdub/harness-subtitles/dist/local-translation.cjs"]; candidates.push(root + "/apps/harness/dist/web-runtime/youdub-plugin/dist/local-translation.cjs", root + "/apps/harness/dist/local-translation.cjs"); const file = candidates.find(path => fs.existsSync(path)); if (!file) throw new Error("Packaged local-translation.cjs is missing from the official runtime. Looked in: " + candidates.join(", ")); const { createRequire } = process.getBuiltinModule("node:module"); return createRequire(file)(file).providers(process.env); })()'
     - id: subprocess
       name: '@deepseek-ai/dsh-subprocess-local'
     - id: plugin-inventory
@@ -71,6 +73,7 @@
       config:
         trustedHosts: !!js ctx.webStartup.trustedHosts
         publicOrigin: !!js ctx.webStartup.publicOrigin
+        launchTokenFile: !!js ctx.webStartup.launchTokenFile
     - id: api-remotes
       name: '@deepseek-ai/dsh-api-remotes'
     - id: ui-theme

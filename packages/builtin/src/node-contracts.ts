@@ -26,7 +26,7 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
   recognize: { ...make('transcribe', '语音识别', 'Transcribe', '文字起こし', 'text', [audio('audio', '音频'), media()], { ...source, initialPrompt: { type: ['string', 'null'] } }, { sourceLanguage: 'auto', initialPrompt: null }), corrections: { outputPorts: ['transcript'], schemaIds: ['transcript/v1'] }, ui: { quickFields: ['sourceLanguage'], detailId: 'youdub.transcript' } },
   translate: { ...make('translate', '翻译', 'Translate', '翻訳', 'text', [transcript()], { ...source, ...target }, { sourceLanguage: 'auto', targetLanguage: 'zh' }), corrections: { outputPorts: ['translation'], schemaIds: ['translation/v1'] }, ui: { quickFields: ['targetLanguage'], detailId: 'youdub.translation' } },
   reference: make('reference', '准备参考音频', 'Voice reference', '参照音声', 'audio', [transcript(), audio('audio', '人声')]),
-  synthesize: make('synthesize', '生成配音', 'Synthesize speech', '吹き替え生成', 'audio', [transcript(), translation(), port('references', '参考音频', 'voice-references/v1', 'json', false)], { ...target, voice: { oneOf: [object({ mode: { const: 'source_clone' } }, ['mode']), object({ mode: { const: 'preset' }, id: { type: 'string', minLength: 1 } }, ['mode', 'id'])] } }, { targetLanguage: 'zh', voice: { mode: 'source_clone' } }),
+  synthesize: make('synthesize', '生成配音', 'Synthesize speech', '吹き替え生成', 'audio', [transcript(), translation(), port('references', '参考音频', 'voice-references/v1', 'json', false)], { ...target, groupCues: { type: 'boolean' }, voice: { oneOf: [object({ mode: { const: 'source_clone' } }, ['mode']), object({ mode: { const: 'preset' }, id: { type: 'string', minLength: 1 } }, ['mode', 'id'])] } }, { targetLanguage: 'zh', groupCues: false, voice: { mode: 'source_clone' } }),
   mix: make('mix', '混音', 'Mix audio', 'ミックス', 'audio', [transcript(), port('speechAudio', '分段配音', 'speech-audio/v1'), media(), audio('background', '背景音', false)], { keepBackground: { type: 'boolean' } }, { keepBackground: false }),
   align: make('align', '字幕对齐', 'Align subtitles', '字幕の整列', 'text', [transcript(), translation(), port('dubbedTimeline', '配音时间轴', 'dubbed-timeline/v1'), port('adjustedSpeech', '调整后配音', 'speech-audio/v1')], target, { targetLanguage: 'zh' }),
   export: make('export', '导出视频', 'Export video', '動画を書き出し', 'output', [video(), media(), transcript(), translation(), audio('finalAudio', '合成音频', false), port('dubbedTimeline', '配音时间轴', 'dubbed-timeline/v1', 'json', false), port('wordAlignment', '词级时间轴', 'word-alignment/v1', 'json', false)], { ...source, ...target, renderSubtitles: { type: 'boolean' } }, { sourceLanguage: 'auto', targetLanguage: 'zh', renderSubtitles: true }),
@@ -34,7 +34,18 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
 }
 
 
-nodeDescriptors.synthesize.ui = { quickFields: ['targetLanguage'], editorId: 'youdub.synthesize' }
+nodeDescriptors.synthesize.configSchema.properties.speakerScope = {
+  type: 'string', enum: ['unknown', 'single', 'multi'],
+  'x-options': [
+    { value: 'unknown', label: { default: 'Unknown speakers: do not join cues', translations: { zh: '未知说话人：不跨句合并', ja: '話者不明：文をまたいで結合しない' } } },
+    { value: 'single', label: { default: 'I confirm one speaker: short cues may join', translations: { zh: '我确认整段只有一个人：短句可以合并', ja: '一人だけと確認：短い文は結合できる' } } },
+    { value: 'multi', label: { default: 'Several people: unlabeled cues stay separate, no speaker detection', translations: { zh: '可能多人：没有说话人识别，未标记的句子各自配音', ja: '複数人の可能性：話者検出はなく、未標記の文は別々' } } },
+  ],
+  description: 'Whisper tiny 不标说话人，这个选项也不会打开说话人识别。默认「未知」不把相邻句合成同一参考。只有确认整段只有一个人时才选「单人」。选择「可能多人」时，没有标记的句子各自配音。已经标成同一人的短句可以合并，不同的人不会合并。',
+}
+nodeDescriptors.synthesize.configSchema.properties.groupCues.description = '短字幕可以合成一段再配音。没有说话人标记时，说话人范围仍是「未知」或「可能多人」就不会跨句合并。这不是说话人识别。'
+nodeDescriptors.synthesize.defaults.speakerScope = 'unknown'
+nodeDescriptors.synthesize.ui = { quickFields: ['speakerScope', 'groupCues', 'targetLanguage'], editorId: 'youdub.synthesize' }
 nodeDescriptors.export.ui = { quickFields: ['targetLanguage'] }
 for (const [operation, title] of Object.entries({ synthesize: ['Dubbing language', '配音语言', '吹き替えの言語'], align: ['Alignment language', '对齐语言', '整列の言語'], export: ['Export language', '导出语言', '書き出しの言語'] })) {
   const properties = nodeDescriptors[operation].configSchema.properties
@@ -56,7 +67,7 @@ const fieldTitles: Record<string, [string, string, string]> = {
   sourceLanguage: ['原文语言', 'Source language', '元の言語'], targetLanguage: ['目标语言', 'Target language', '翻訳先の言語'],
   initialPrompt: ['识别提示词', 'Recognition prompt', '認識プロンプト'],
   proxyPort: ['本机 HTTP 代理端口（0 为直连）', 'Local HTTP proxy port (0 for direct)', 'ローカル HTTP プロキシポート（0 は直接接続）'],
-  voice: ['声音', 'Voice', '音声'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
+  voice: ['声音', 'Voice', '音声'], speakerScope: ['说话人范围', 'Speaker scope', '話者の範囲'], groupCues: ['短句合并', 'Group short cues', '短い文をまとめる'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
   renderSubtitles: ['烧录字幕', 'Burn subtitles', '字幕を焼き込む'], url: ['视频链接', 'Video URL', '動画リンク'],
 }
 for (const descriptor of Object.values(nodeDescriptors)) for (const schema of [descriptor.configSchema, descriptor.runtimeInputSchema]) {

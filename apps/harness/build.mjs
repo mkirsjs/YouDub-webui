@@ -2,7 +2,7 @@ import { checkLocales } from './check-locales.mjs';
 import { build } from 'esbuild';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve, dirname } from 'node:path';
-import { readFile, writeFile } from 'node:fs/promises';
+import { cp, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { readFrameworkSource } from './framework-source.mjs';
 await checkLocales();
@@ -57,12 +57,15 @@ const host = await build({ ...common, entryPoints: ['src/host.mjs'], outfile: 'd
     builder.onResolve({ filter: /^@youdub\/sdk\// }, args => ({ path: resolve(root, 'packages/sdk/src', args.path.slice('@youdub/sdk/'.length) + '.ts') }));
   } }],
 });
+await cp(resolve(here, 'src/backend/local-translation.cjs'), resolve(here, 'dist/local-translation.cjs'));
 const client = await build({ ...common, entryPoints: ['src/client.jsx'], outfile: 'dist/client.js', platform: 'browser', format: 'cjs', jsx: 'automatic', metafile: true,
   external: ['react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-store'], loader: { '.css': 'text' }, nodePaths: [resolve(here, 'node_modules'), resolve(web, 'node_modules')],
   define: { 'process.env.DSH_CLIENT_VERSION': JSON.stringify(product.version), 'process.env.DSH_CLIENT_TITLE': JSON.stringify('YouDub'), 'process.env.DSH_CLIENT_COMMIT_HASH': 'undefined', 'process.env.DSH_CLIENT_GIT_DIRTY': 'undefined' },
   alias: { '@': resolve(web, 'src') },
   plugins: [sourceBuiltImports, officialAssets, { name: 'youdub-component-boundaries', setup(builder) {
     builder.onResolve({ filter: /^cordis$/ }, () => ({ path: '@deepseek-ai/cordis', external: true }));
+    builder.onResolve({ filter: /^@youdub\/sdk$/ }, () => ({ path: resolve(root, 'packages/sdk/src/index.ts') }));
+    builder.onResolve({ filter: /^@youdub\/sdk\// }, args => ({ path: resolve(root, 'packages/sdk/src', args.path.slice('@youdub/sdk/'.length) + '.ts') }));
     // Both tests and Desktop use the same YouDub wrappers. Only resolve their shared
     // framework dependency to the module already owned by the official client loader.
     builder.onResolve({ filter: /(?:^|\/)harness-primitives$/ }, args => {

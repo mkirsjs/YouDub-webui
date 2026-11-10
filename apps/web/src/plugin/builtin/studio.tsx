@@ -17,6 +17,8 @@ import { ACTIVE_STATUSES, TaskProgress, TaskState, taskDisplayName } from './tas
 import { ConfigEditor, defaultConfig, schemaProblems, useEditorSupported, validateConfig } from './schema-form'
 import { useActiveView, useObservableSource } from '../view-hooks'
 import { StudioDraftStore, type ComposerDraft } from '@/runtime/studio-draft'
+import { UploadMeter, uploadErrorText } from '@/runtime/upload-meter'
+import { formatBytes } from '@/runtime/upload-progress'
 import { GraphStudio } from './workflows'
 import { UploadSlot } from './media-upload'
 
@@ -92,8 +94,9 @@ function Composer({ workflow, draftStore, afterInputs, onLockChange, request, na
         </div>
       </div>
     </Surface>
+    {busy && submission?.upload && <div className="mt-4"><UploadMeter snapshot={submission.upload} sending={tx('upload.sending')} importing={tx('upload.importing')} sent={tx('upload.sent')} noResume={tx('upload.no.resume')} speed={submission.upload.bytesPerSecond ? tx('upload.speed', { speed: formatBytes(submission.upload.bytesPerSecond) }) : ''} /></div>}
     {(error || (pendingId && !busy)) && <div className="mt-4 space-y-3">
-      {error && <InlineAlert>{error}</InlineAlert>}
+      {error && <InlineAlert>{uploadErrorText(error, tx)}</InlineAlert>}
       {pendingId && !busy && <div className="space-y-2 text-sm"><p className="break-all text-muted-foreground">{tx("studio.task.id")}{pendingId}</p><div className="flex flex-wrap gap-2">
         <Button type="button" variant="outline" onClick={() => { void draftStore.check(submissionKey, request).then(task => { if (task) openTask(task) }) }}>{tx("studio.check.task.status")}</Button>
         <Button type="button" variant="outline" onClick={() => { void draftStore.discard(submissionKey, request).then(cleared => { if (cleared && activeView.current) setError('') }) }}>{tx("studio.clear.this.import")}</Button>

@@ -3,6 +3,10 @@
 from pathlib import Path
 from .errors import ApiError
 
+# A whole clip quieter than -60 dBFS has no usable speech. This rejects digital
+# silence. It does not trim, fade, or overlap a clip.
+SPEECH_PEAK_FLOOR = 1e-3
+
 
 def audio_info(path: Path, *, stage: str):
     if not path.is_file() or path.stat().st_size == 0:

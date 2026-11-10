@@ -400,7 +400,10 @@ def test_child_missing_model_package_is_explicit(context, monkeypatch, capsys):
     assert not any(Path(clip["output_path"]).exists() for clip in clips)
 
 
-@pytest.mark.parametrize("waveform", [np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100))])
+@pytest.mark.parametrize("waveform", [
+    np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100)),
+    np.zeros(4800), np.full(4800, 1e-4),
+])
 def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys, waveform):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
@@ -417,3 +420,231 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
     assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "INVALID_PROVIDER_RESULT"
     assert len(calls) == 1
     assert not any(Path(clip["output_path"]).exists() for clip in clips)
+
+
+class _Parameter:
+    def __init__(self, device):
+        self.device = device
+
+
+class _TTS:
+    def __init__(self, device_name):
+        self.sample_rate = 48000
+        self.params = [_Parameter(device_name)]
+        self.placed = []
+
+    def parameters(self):
+        return self.params
+
+    def to(self, device):
+        self.placed.append(device)
+        for parameter in self.params:
+            parameter.device = device
+        return self
+
+
+def _install_vox(monkeypatch, device_name, generated, loaded, start_on="same"):
+    def generate(**kwargs):
+        generated.append(kwargs)
+        return np.full(4800, 0.25)
+
+    def load(*args, **kwargs):
+        initial = device_name if start_on == "same" else start_on
+        tts_model = _TTS(initial)
+        loaded.append({"args": args, "kwargs": kwargs, "tts": tts_model})
+        return SimpleNamespace(tts_model=tts_model, generate=generate)
+
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
+
+
+def test_cuda_request_fails_closed_when_parameters_stay_on_cpu(context, monkeypatch, capsys):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+
+    class Stuck(_TTS):
+        def to(self, device):
+            self.placed.append(device)
+            return self
+
+    def generate(**kwargs):
+        generated.append(kwargs)
+        return np.full(4800, 0.25)
+
+    def load(*args, **kwargs):
+        loaded.append(kwargs)
+        tts_model = Stuck("cpu")
+        loaded.append(tts_model)
+        return SimpleNamespace(tts_model=tts_model, generate=generate)
+
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=load)))
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 1
+    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
+    assert loaded[0]["device"] == "cuda:0" and loaded[1].placed == ["cuda:0"]
+    assert not generated
+    assert not any(Path(clip["output_path"]).exists() for clip in clips)
+
+
+def test_cuda_request_fails_when_a_buffer_stays_on_cpu(context, monkeypatch, capsys):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated = []
+
+    class HalfMoved(_TTS):
+        def __init__(self):
+            super().__init__("cpu")
+            self.bufs = [_Parameter("cpu")]
+
+        def buffers(self):
+            return self.bufs
+
+        def to(self, device):
+            self.placed.append(device)
+            for parameter in self.params:
+                parameter.device = device
+            return self
+
+    def generate(**kwargs):
+        generated.append(kwargs)
+        return np.full(4800, 0.25)
+
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(
+        from_pretrained=lambda *args, **kwargs: SimpleNamespace(
+            tts_model=HalfMoved(), generate=generate,
+        ))))
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 1
+    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "MODEL_NOT_READY"
+    assert not generated
+    assert not any(Path(clip["output_path"]).exists() for clip in clips)
+
+
+def test_cuda_placement_moves_cpu_parameters_before_generate(context, monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+    _install_vox(monkeypatch, "cuda:0", generated, loaded, start_on="cpu")
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 0
+    assert loaded[0]["kwargs"]["device"] == "cuda:0"
+    assert loaded[0]["tts"].placed == ["cuda:0"]
+    assert loaded[0]["tts"].params[0].device == "cuda:0"
+    assert len(generated) == len(clips)
+    assert generated[0]["normalize"] is False and generated[0]["retry_badcase"] is False
+
+
+def test_cuda_request_records_tensor_device_and_loads_once(context, monkeypatch, capsys):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+    _install_vox(monkeypatch, "cuda:0", generated, loaded)
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cuda:0"
+    assert tts_process.main(arguments) == 0
+    assert len(loaded) == 1 and len(generated) == len(clips)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    device = next(item for item in events if item["event"] == "device")
+    assert device["tensor_devices"] == ["cuda:0"]
+    assert device["requested_device"] == "cuda:0"
+
+
+def test_verified_receipt_is_reused_and_bare_wav_is_not(context, monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+    _install_vox(monkeypatch, "cpu", generated, loaded)
+    clips, arguments = child_request(context)
+    arguments[arguments.index("--device") + 1] = "cpu"
+    assert tts_process.main(arguments) == 0
+    assert len(loaded) == 1 and len(generated) == len(clips)
+    original = Path(clips[0]["output_path"]).read_bytes()
+    loaded.clear()
+    generated.clear()
+    assert tts_process.main(arguments) == 0
+    assert loaded == [] and generated == []
+    assert Path(clips[0]["output_path"]).read_bytes() == original
+    bare = Path(clips[1]["output_path"])
+    bare.with_name(bare.name + ".receipt.json").unlink()
+    bare_bytes = bare.read_bytes()
+    assert tts_process.main(arguments) == 0
+    assert len(generated) == 1
+    preserved = list((bare.parent / "preserved").glob(bare.name + ".*"))
+    assert len(preserved) == 1 and preserved[0].read_bytes() == bare_bytes
+
+
+def test_checksum_adopt_writes_receipt_without_changing_wav_and_later_resume_copies_it(context, monkeypatch, tmp_path):
+    from backend.app.v1 import tts_resume
+
+    task = tmp_path / "task"
+    reference = task / "references" / "000001.wav"
+    reference.parent.mkdir(parents=True)
+    reference.write_bytes(context.input_files["vocals"].read_bytes())
+    previous = task / "attempts" / "1" / "old" / "tts"
+    previous.mkdir(parents=True)
+    wav = previous / "000001.wav"
+    sf.write(wav, np.full(1600, 0.2), 16000, subtype="PCM_16")
+    clip = {"segment_id": "one", "text": " 第一段。\n", "reference_path": str(reference.resolve()),
+            "reference_text": "Original A1", "output_path": str(wav.resolve())}
+    request = previous / "request.json"
+    request.write_text(json.dumps({"clips": [clip]}), encoding="utf-8")
+    lines = []
+    for path in (wav, request, reference.resolve()):
+        lines.append(f"{__import__('hashlib').sha256(path.read_bytes()).hexdigest()}  {path.resolve()}")
+    checksums = tmp_path / "backup.sha256"
+    checksums.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    before = wav.read_bytes()
+    assert tts_resume.main(["--task-root", str(task), "--model-path", str(tts.model_directory()),
+                            "--checksums", str(checksums)]) == 0
+    assert wav.read_bytes() == before
+    assert (previous / "000001.wav.receipt.json").is_file()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    generated, loaded = [], []
+    _install_vox(monkeypatch, "cuda:0", generated, loaded)
+    output = tmp_path / "new" / "000001.wav"
+    new_request = tmp_path / "new-request.json"
+    new_clip = {**clip, "output_path": str(output)}
+    new_request.write_text(json.dumps({"clips": [new_clip]}), encoding="utf-8")
+    assert tts_process.main(["--model-path", str(tts.model_directory()), "--request-path", str(new_request),
+                             "--device", "cuda:0", "--task-root", str(task)]) == 0
+    assert loaded == [] and generated == []
+    assert output.read_bytes() == before
+
+
+def test_adopt_refuses_a_checksum_mismatch_and_writes_nothing(context, tmp_path):
+    from backend.app.v1 import tts_resume
+
+    reference = context.input_files["vocals"]
+    task = tmp_path / "task"
+    folder = task / "attempts" / "1" / "old" / "tts"
+    folder.mkdir(parents=True)
+    wav = folder / "000001.wav"
+    sf.write(wav, np.full(800, 0.2), 16000, subtype="PCM_16")
+    request = folder / "request.json"
+    request.write_text(json.dumps({"clips": [{"segment_id": "one", "text": "A", "reference_text": "B",
+                                             "reference_path": str(reference.resolve()), "output_path": str(wav)}]}),
+                       encoding="utf-8")
+    checksums = tmp_path / "backup.sha256"
+    checksums.write_text(
+        f"{'0' * 64}  {wav.resolve()}\n",
+        encoding="utf-8",
+    )
+    assert tts_resume.main(["--task-root", str(task), "--model-path", str(tts.model_directory()),
+                            "--checksums", str(checksums)]) == 1
+    assert not (folder / "000001.wav.receipt.json").exists()
+    assert wav.read_bytes() == wav.read_bytes()
+
+
+def test_run_media_polls_until_exit_without_dropping_stdout():
+    seen = []
+    result = media._run_media(
+        [sys.executable, "-c", "import time; time.sleep(0.35); print('done')"],
+        check_cancel=lambda: None, poll=lambda: seen.append(1),
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "done"
+    assert len(seen) >= 2

@@ -28,6 +28,8 @@ export YOUDUB_PUBLIC_ORIGIN='https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn'
 
 The same value may be passed as `--public-origin` after `--no-open`. One exact origin. A wildcard, path, or second host is rejected at startup. Unset, localhost behavior is unchanged.
 
+Without `YOUDUB_LAUNCH_TOKEN_FILE`, the printed `?token=` is a new random value on every process. Set that absolute path, as described in `artifacts/voxcpm-resume-deploy.md`, to reuse one mode-0600 file. The origin check, cookie signing, and rejection of a missing or foreign token stay the same.
+
 Restart that process in its existing tmux/nohup session. The log line `YouDub web: https://7860-cpod-1xhxbe8kv5n4.pod.compshare.cn/?token=...` is the browser URL.
 
 ## nginx

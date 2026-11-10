@@ -73,6 +73,9 @@ class Operation:
                 values["initial_prompt"] = self.option("initialPrompt", "initial_prompt", values.get("initial_prompt"))
             if name == "tts":
                 values["voice"] = SimpleNamespace(**self.option("voice", default=values.get("voice") or {"mode": "source_clone"}))
+                values["group_cues"] = bool(self.option("groupCues", "group_cues", False))
+                values["speaker_scope"] = self.option("speakerScope", "speaker_scope", "unknown")
+                values["single_speaker"] = bool(self.option("singleSpeaker", "single_speaker", False))
             return SimpleNamespace(**values)
         # Build only this operation's parameters. Historical task aliases remain
         # accepted by option(); unrelated model selections never enter the stage.
@@ -174,7 +177,7 @@ class Operation:
             if not isinstance(text, str) or not text.strip():
                 raise WorkerError("INVALID_INPUT", f"Reference transcript is missing for segment {segment_id}.")
             prepared[segment_id] = {"path": self.path(ref.get("audio")), "text": text}
-        result = tts.run(context, self.wire.progress, prepared_references=prepared)
+        result = tts.run(context, self.wire.progress, prepared_references=prepared, task_root=self.root)
         clips = json.loads(result.output_files["speech_clips"].read_text())["clips"]
         segments = []
         for clip in clips:
@@ -199,10 +202,17 @@ class Operation:
         if "background" in self.inputs:
             files["background"] = self.path(self.inputs["background"])
         result = mix.run(self.context("mix", files), self.wire.progress)
+        placement_path = self.work / "placement.json"
+        if placement_path.is_file():
+            rows = json.loads(placement_path.read_text(encoding="utf-8"))
+        else:
+            rows = [{"file": f"adjusted/{index + 1:04d}.wav", "member_ids": [segment["id"]]}
+                    for index, segment in enumerate(self.json_value("transcript")["segments"])]
         adjusted = []
-        for index, segment in enumerate(self.json_value("transcript")["segments"]):
-            audio, info = self.audio("adjusted." + segment["id"], self.work / "adjusted" / f"{index + 1:04d}.wav")
-            adjusted.append({"id": segment["id"], "audio": audio, **info})
+        for row in rows:
+            label = row["member_ids"][0]
+            audio, info = self.audio("adjusted." + label, self.work / row["file"])
+            adjusted.append({"id": label, "audio": audio, **info})
         return {"finalAudio": self.audio("finalAudio", result.output_files["mixed_audio"])[0],
                 "dubbedTimeline": json.loads(result.output_files["alignment"].read_text()),
                 "adjustedSpeech": {"segments": adjusted}}

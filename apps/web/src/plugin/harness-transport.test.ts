@@ -8,11 +8,26 @@ it('uses the product RPC envelope and sends uploads through its dedicated authen
   const signal = new AbortController().signal
   await requestHarness('/api/v2/settings', { method: 'PATCH', body: JSON.stringify({ ui_language: 'zh' }), signal })
   expect(fetch).toHaveBeenCalledWith('/api/youdub/v2', expect.objectContaining({ method: 'POST', credentials: 'include', signal, body: JSON.stringify({ method: 'PATCH', path: '/api/v2/settings', body: { ui_language: 'zh' } }) }))
+  const sent: { url?: string; body?: FormData; credentials?: boolean } = {}
+  class FakeXHR {
+    upload = {}
+    withCredentials = false
+    status = 200
+    responseText = JSON.stringify({ id: 'task' })
+    open(_method: string, url: string) { sent.url = url }
+    set body(value: FormData) { sent.body = value }
+    send(value: FormData) { sent.body = value; sent.credentials = this.withCredentials; queueMicrotask(() => (this as { onload?: () => void }).onload?.()) }
+    getResponseHeader() { return 'application/json' }
+  }
+  vi.stubGlobal('XMLHttpRequest', FakeXHR)
   const body = new FormData(); body.set('request', '{}')
   await requestHarness('/api/v2/tasks', { method: 'POST', body })
-  expect(fetch).toHaveBeenLastCalledWith('/api/youdub/upload', expect.objectContaining({ body, credentials: 'include', headers: undefined }))
+  expect(sent.url).toBe('/api/youdub/upload')
+  expect(sent.body).toBe(body)
+  expect(sent.credentials).toBe(true)
+  expect(fetch).toHaveBeenCalledTimes(1)
   await expect(requestHarness('https://external.invalid')).rejects.toThrow('Unsupported YouDub API path')
-  expect(fetch).toHaveBeenCalledTimes(2)
+  expect(fetch).toHaveBeenCalledTimes(1)
 })
 it('preserves streamed authorization errors and propagates request cancellation', async () => {
   vi.stubGlobal('fetch', vi.fn(async (_path: string, init: RequestInit) => {

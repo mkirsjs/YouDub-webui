@@ -3,10 +3,11 @@ import type { JsonObject } from '@/plugin/sdk'
 import type { InputFile } from '@/plugin/builtin/workflow-launch'
 import type { Request } from '@/plugin/runtime/types'
 import type { TaskView } from '@/plugin/contracts'
+import type { UploadSnapshot } from '@/runtime/upload-progress'
 
 export type WorkflowRunDraft = { selectedFiles: InputFile[]; sourceUrl: string; proxyPort?: number; runtimeByDocument: Record<string, Record<string, JsonObject>> }
 export type ComposerDraft = { files: Record<string, File>; sourceUrl: string; config: JsonObject }
-export type Submission = { id: string; path: string; body: FormData | string; busy: boolean; error: string; failure?: unknown; task?: TaskView }
+export type Submission = { id: string; path: string; body: FormData | string; busy: boolean; error: string; failure?: unknown; task?: TaskView; upload?: UploadSnapshot }
 type StudioDraft = { selected: string; selectedGraph: string; draft: WorkflowRunDraft; overrides: Record<string, Record<string, JsonObject>>; composers: Record<string, ComposerDraft>; submissions: Record<string, Submission> }
 const empty = (): StudioDraft => ({ selected: '', selectedGraph: '', draft: { selectedFiles: [], sourceUrl: '', runtimeByDocument: {} }, overrides: {}, composers: {}, submissions: {} })
 
@@ -37,7 +38,10 @@ export class StudioDraftStore {
       this.set('submissions', current => ({ ...current, [key]: submission! }))
     }
     if (submission.task) return submission.task
-    return this.resolve(key, () => request<TaskView>(submission.path, { method: 'POST', body: submission.body }))
+    const upload = submission.body instanceof FormData
+      ? { onUploadProgress: (progress: UploadSnapshot) => this.set('submissions', current => current[key] ? { ...current, [key]: { ...current[key], upload: progress } } : current) }
+      : {}
+    return this.resolve(key, () => request<TaskView>(submission.path, { method: 'POST', body: submission.body, ...upload }))
   }
   async check(key: string, request: Request) {
     const submission = this.getSnapshot().submissions[key]

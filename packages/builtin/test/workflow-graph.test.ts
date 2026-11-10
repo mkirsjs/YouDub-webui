@@ -30,6 +30,24 @@ async function setup(t: any, devices: Record<string, string[]> = {}) {
   return { ctx, compile, templates, subtitles: templates[0].document }
 }
 
+test('synthesize descriptions are schema strings and the dubbing graph validates', async t => {
+  const { default: Ajv } = await import('ajv/dist/2020.js')
+  const { nodeDescriptors } = await import('../src/node-contracts.js')
+  const schema = nodeDescriptors.synthesize.configSchema
+  const ajv = new Ajv({ strict: false, allErrors: true })
+  ajv.compile(schema)
+  assert.equal(typeof schema.properties.groupCues.description, 'string')
+  assert.equal(typeof schema.properties.speakerScope.description, 'string')
+  const { compile, templates } = await setup(t)
+  const dubbing = templates.find(item => item.id === 'youdub.dubbing')!.document
+  const unknown = await compile(dubbing)
+  assert.equal(unknown.plan.bindings.synthesize.options.speakerScope, 'unknown')
+  assert.equal(unknown.plan.bindings.synthesize.options.groupCues, true)
+  const single = structuredClone(dubbing)
+  single.nodes.find(node => node.id === 'synthesize')!.config.speakerScope = 'single'
+  assert.equal((await compile(single)).plan.bindings.synthesize.options.speakerScope, 'single')
+})
+
 test('independent templates compile without mutating graph and only freeze selected resources', async t => {
   const { templates, compile } = await setup(t)
   const plans = await Promise.all(templates.map(async item => {
@@ -46,6 +64,9 @@ test('independent templates compile without mutating graph and only freeze selec
   assert.ok(plans[0].steps.every(step => !['synthesize', 'separate', 'reference', 'mix'].includes(step.id)))
   assert.deepEqual(templates.map(item => item.id), ['youdub.subtitles', 'youdub.dubbing', 'youdub.subtitles-dubbing'])
   assert.equal(plans[1].bindings.export.options.outputMode, 'dubbing')
+  assert.equal(plans[1].bindings.synthesize.options.groupCues, true)
+  assert.equal(plans[1].bindings.synthesize.options.speakerScope, 'unknown')
+  assert.equal(plans[1].bindings.synthesize.options.groupCues === true && plans[1].bindings.synthesize.options.speakerScope !== 'single', true)
   assert.equal(plans[2].bindings.export.options.outputMode, 'both')
   const reviewed = structuredClone(templates[0].document)
   reviewed.nodes.find(node => node.id === 'recognize')!.autoContinue = false

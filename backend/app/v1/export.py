@@ -28,6 +28,19 @@ SUBTITLE_FONT_SIZES = {
 SUBTITLE_BREAK_PUNCTUATION = "，,；;：:。?？!！、.—"
 
 
+def video_encoder_args() -> list[str]:
+    """Encode the output video on CPU with libx264.
+
+    ``ffmpeg -encoders`` can list ``h264_nvenc`` when the binary was built with
+    NVENC even if the driver refuses a session. On the measured RTX 4090 host a
+    one-second NVENC encode failed with OpenEncodeSessionEx unsupported device,
+    while CUDA allocation for inference succeeded. This path does not probe the
+    encoder list and does not add a hardware decode or filter chain. Audio stays
+    AAC and the subtitle filter is unchanged.
+    """
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"]
+
+
 def _subtitle_style(font: str, size: int, margin_v: int) -> str:
     return (
         f"FontName={font},"
@@ -276,8 +289,8 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
                                               context.config.target_language)
         command.extend(["-vf", f"subtitles=filename=translated.srt:force_style='{style}'"])
     command.extend([
-        "-map", "0:v:0", "-map", "1:a:0" if include_dubbing else "0:a:0", "-c:v", "libx264",
-        "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+        "-map", "0:v:0", "-map", "1:a:0" if include_dubbing else "0:a:0",
+        *video_encoder_args(), "-c:a", "aac", "-movflags", "+faststart",
         str(final_video.resolve()),
     ])
     try:

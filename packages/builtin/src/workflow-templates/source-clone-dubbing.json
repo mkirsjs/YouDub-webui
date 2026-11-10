@@ -52,7 +52,7 @@
       "type": "youdub.synthesize",
       "typeVersion": "1.0.0",
       "provider": { "id": "voxcpm", "model": "VoxCPM2", "device": "auto" },
-      "config": { "targetLanguage": "zh", "voice": { "mode": "source_clone" } },
+      "config": { "targetLanguage": "zh", "groupCues": true, "speakerScope": "unknown", "voice": { "mode": "source_clone" } },
       "autoContinue": true
     },
     {

@@ -17,7 +17,7 @@ after(() => source.unregister());
 // This endpoint is deliberately a local fixture. It verifies the actual official
 // adapter's request bytes; it makes no claim about external translation quality.
 test('translation uses official Harness call defaults and surfaces provider rejection', { timeout: 30000 }, async t => {
-  const calls = []; let reject = false;
+  const calls = []; let reject = false; let truncate = false; let forceLength = false;
   const server = createServer(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw); calls.push({ path: req.url, body });
@@ -40,9 +40,13 @@ test('translation uses official Harness call defaults and surfaces provider reje
       for (const event of events) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       res.end(); return;
     }
+    const serialized = JSON.stringify(body);
+    const ids = [...serialized.matchAll(/"segment_id":"([^"]+)"/g)].map(match => match[1]);
+    const limited = forceLength || (truncate && ids.length > 1);
+    const payload = limited ? '{' : JSON.stringify({ segments: (ids.length ? ids : ['s1']).map(id => ({ segment_id: id, text: '你好' })) });
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write('data: ' + JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{ index: 0, delta: { role: 'assistant', content: JSON.stringify({ segments: [{ segment_id: 's1', text: '你好' }] }) }, finish_reason: null }] }) + '\n\n');
-    res.write('data: ' + JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } }) + '\n\n');
+    res.write('data: ' + JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{ index: 0, delta: { role: 'assistant', content: payload }, finish_reason: null }] }) + '\n\n');
+    res.write('data: ' + JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{ index: 0, delta: {}, finish_reason: limited ? 'length' : 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } }) + '\n\n');
     res.end('data: [DONE]\n\n');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -107,6 +111,35 @@ test('translation uses official Harness call defaults and surfaces provider reje
       const before = calls.length;
       await assert.rejects((await execute({}, 'fixture', 'unknown-model')).result, { code: 'UNKNOWN_MODEL' });
       assert.equal(calls.length, before);
+    });
+    await t.test('a truncated batch is split until every segment id is returned', async () => {
+      truncate = true; reject = false;
+      const before = calls.length;
+      const dir = await mkdtemp(join(tmpdir(), 'youdub-llm-fixture-')); dirs.push(dir);
+      const result = await translateWithHarness(ctx.llm, 'fixture', {
+        invocationId: 'split', workDir: dir,
+        inputs: { transcript: { detected_language: 'en', segments: [
+          { id: 's1', start_ms: 0, end_ms: 1000, text: 'one' },
+          { id: 's2', start_ms: 1000, end_ms: 2000, text: 'two' },
+        ] } },
+        binding: { model: 'fixture-model', options: { targetLanguage: 'zh' } }, config: {},
+      }, { signal: new AbortController().signal, progress: async () => {}, externalPrepare: async () => {}, externalUpdate: async () => {} });
+      assert.deepEqual(result.outputs.translation.segments.map(segment => segment.segment_id), ['s1', 's2']);
+      assert.equal(calls.length, before + 3);
+      assert.equal(calls[before].body.choices, undefined);
+      truncate = false;
+    });
+    await t.test('one segment that still hits the output cap fails instead of inventing text', async () => {
+      forceLength = true; truncate = false; reject = false;
+      const before = calls.length;
+      const dir = await mkdtemp(join(tmpdir(), 'youdub-llm-fixture-')); dirs.push(dir);
+      await assert.rejects(translateWithHarness(ctx.llm, 'fixture', {
+        invocationId: 'one', workDir: dir,
+        inputs: { transcript: { detected_language: 'en', segments: [{ id: 'only', start_ms: 0, end_ms: 500, text: 'solo' }] } },
+        binding: { model: 'fixture-model', options: { targetLanguage: 'zh' } }, config: {},
+      }, { signal: new AbortController().signal, progress: async () => {}, externalPrepare: async () => {}, externalUpdate: async () => {} }), /max-tokens/);
+      assert.equal(calls.length, before + 1);
+      forceLength = false;
     });
     await t.test('endpoint incompatibility remains a visible failure without a lower-cap retry', async () => {
       reject = true;

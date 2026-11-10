@@ -9,6 +9,7 @@
   "exports": {
     ".": "./dist/host.mjs",
     "./client": "./dist/client.js",
+    "./local-translation.cjs": "./dist/local-translation.cjs",
     "./package.json": "./package.json"
   },
   "dsh": {

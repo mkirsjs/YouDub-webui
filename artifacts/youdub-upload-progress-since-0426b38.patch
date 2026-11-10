@@ -1,0 +1,416 @@
+diff --git a/apps/harness/src/frontend/runtime.tsx b/apps/harness/src/frontend/runtime.tsx
+index bca291a..f924530 100644
+--- a/apps/harness/src/frontend/runtime.tsx
++++ b/apps/harness/src/frontend/runtime.tsx
+@@ -2,20 +2,23 @@ import React, { createContext, useContext, useEffect, useMemo, useSyncExternalSt
+ import { QueryClient } from '../../../web/src/plugin/runtime/query'
+ import { WorkflowResourceChecks, changesResources, resourceKey } from '../../../web/src/plugin/runtime/workflow-resources'
+ import { responseBody } from '../../../web/src/runtime/http'
++import { xhrUpload } from '../../../web/src/runtime/xhr-upload'
++import type { UploadSnapshot } from '../../../web/src/runtime/upload-progress'
+ import { StudioDraftStore } from '../../../web/src/runtime/studio-draft'
+ import type { Request } from '../../../web/src/plugin/runtime/types'
+ const Features = createContext<any>(null)
+ export const FeatureProvider = Features.Provider
+ export function useFeatures() { const value = useContext(Features); if (!value) throw new Error('YouDub feature bindings are unavailable'); return value }
+ export const domainSlots = ['config.editors','task.detail.panels','task.detail.actions','workflow.node.editors','workflow.node.details']
+-export async function requestHarness<T>(path:string, init:RequestInit = {}):Promise<T> {
++export async function requestHarness<T>(path:string, init:RequestInit & { onUploadProgress?: (snapshot: UploadSnapshot) => void } = {}):Promise<T> {
+     if (!path.startsWith('/api/')) throw new Error(`Unsupported YouDub API path: ${path}`)
+     const method = (init.method ?? 'GET').toUpperCase()
+     const multipart = init.body instanceof FormData
+-    const response = await fetch(multipart ? '/api/youdub/upload' : '/api/youdub/v2', {
++    if (multipart) return xhrUpload<T>('/api/youdub/upload', init.body, { signal: init.signal ?? undefined, onProgress: init.onUploadProgress })
++    const response = await fetch('/api/youdub/v2', {
+       method:'POST', signal:init.signal, credentials:'include',
+-      headers:multipart ? undefined : { 'content-type':'application/json' },
+-      body:multipart ? init.body : JSON.stringify({ method, path, ...(init.body ? { body:typeof init.body === 'string' ? JSON.parse(init.body) : init.body } : {}) }),
++      headers:{ 'content-type':'application/json' },
++      body:JSON.stringify({ method, path, ...(init.body ? { body:typeof init.body === 'string' ? JSON.parse(init.body) : init.body } : {}) }),
+     })
+     return responseBody<T>(response)
+ }
+diff --git a/apps/web/src/locales/en.json b/apps/web/src/locales/en.json
+index 90301b8..4436fe1 100644
+--- a/apps/web/src/locales/en.json
++++ b/apps/web/src/locales/en.json
+@@ -192,6 +192,13 @@
+     "workflow.run.start.processing": "Start processing",
+     "workflow.run.start.workflow": "Start workflow",
+     "workflow.run.connection.settings": "Connection settings",
++    "upload.sending": "Uploading the file",
++    "upload.importing": "The file has been sent. The server is importing it and creating the task. Dubbing has not started.",
++    "upload.sent": "Upload reached 100%. Waiting for the server to accept the file.",
++    "upload.no.resume": "The whole file is sent once. An interruption cannot resume from the bytes already sent.",
++    "upload.speed": "{speed}/s",
++    "upload.interrupted": "Upload interrupted. Send the whole file again. Resume from the interruption point is not supported.",
++    "upload.failed": "Upload connection failed. Send the whole file again. Resume from the interruption point is not supported.",
+     "library.library": "Library",
+     "library.new.task": "New task",
+     "library.task.status": "Task status",
+diff --git a/apps/web/src/locales/ja.json b/apps/web/src/locales/ja.json
+index db9430d..0be5446 100644
+--- a/apps/web/src/locales/ja.json
++++ b/apps/web/src/locales/ja.json
+@@ -193,6 +193,13 @@
+     "workflow.run.start.processing": "処理を開始",
+     "workflow.run.start.workflow": "ワークフローを実行",
+     "workflow.run.connection.settings": "接続設定",
++    "upload.sending": "ファイルをアップロードしています",
++    "upload.importing": "ファイルは送信済みです。サーバーが取り込み、タスクを作成しています。吹き替えはまだ始まっていません。",
++    "upload.sent": "アップロードは 100% です。サーバーの受信を待っています。",
++    "upload.no.resume": "ファイルは一度に送信します。中断した位置から再開することはできません。",
++    "upload.speed": "{speed}/秒",
++    "upload.interrupted": "アップロードが中断されました。ファイル全体を送り直してください。中断位置からの再開には対応していません。",
++    "upload.failed": "アップロード接続に失敗しました。ファイル全体を送り直してください。中断位置からの再開には対応していません。",
+     "library.library": "ライブラリ",
+     "library.new.task": "新しいタスク",
+     "library.task.status": "タスクの状態",
+diff --git a/apps/web/src/locales/zh.json b/apps/web/src/locales/zh.json
+index c841162..a1a2a4d 100644
+--- a/apps/web/src/locales/zh.json
++++ b/apps/web/src/locales/zh.json
+@@ -193,6 +193,13 @@
+     "workflow.run.start.processing": "开始处理",
+     "workflow.run.start.workflow": "开始运行",
+     "workflow.run.connection.settings": "连接设置",
++    "upload.sending": "正在上传文件",
++    "upload.importing": "文件已全部发出。服务器正在导入并创建任务，配音还没开始。",
++    "upload.sent": "上传已到 100%。正在等待服务器接收文件。",
++    "upload.no.resume": "一次发送整个文件。中断后不能从已传位置续传。",
++    "upload.speed": "{speed}/秒",
++    "upload.interrupted": "上传已中断。需要重新发送整个文件，不能从中断处续传。",
++    "upload.failed": "上传连接失败。需要重新发送整个文件，不能从中断处续传。",
+     "library.library": "任务库",
+     "library.new.task": "新建任务",
+     "library.task.status": "任务状态",
+diff --git a/apps/web/src/plugin/builtin/studio.tsx b/apps/web/src/plugin/builtin/studio.tsx
+index b6e256f..85867c2 100644
+--- a/apps/web/src/plugin/builtin/studio.tsx
++++ b/apps/web/src/plugin/builtin/studio.tsx
+@@ -17,6 +17,8 @@ import { ACTIVE_STATUSES, TaskProgress, TaskState, taskDisplayName } from './tas
+ import { ConfigEditor, defaultConfig, schemaProblems, useEditorSupported, validateConfig } from './schema-form'
+ import { useActiveView, useObservableSource } from '../view-hooks'
+ import { StudioDraftStore, type ComposerDraft } from '@/runtime/studio-draft'
++import { UploadMeter, uploadErrorText } from '@/runtime/upload-meter'
++import { formatBytes } from '@/runtime/upload-progress'
+ import { GraphStudio } from './workflows'
+ import { UploadSlot } from './media-upload'
+ 
+@@ -92,8 +94,9 @@ function Composer({ workflow, draftStore, afterInputs, onLockChange, request, na
+         </div>
+       </div>
+     </Surface>
++    {busy && submission?.upload && <div className="mt-4"><UploadMeter snapshot={submission.upload} sending={tx('upload.sending')} importing={tx('upload.importing')} sent={tx('upload.sent')} noResume={tx('upload.no.resume')} speed={submission.upload.bytesPerSecond ? tx('upload.speed', { speed: formatBytes(submission.upload.bytesPerSecond) }) : ''} /></div>}
+     {(error || (pendingId && !busy)) && <div className="mt-4 space-y-3">
+-      {error && <InlineAlert>{error}</InlineAlert>}
++      {error && <InlineAlert>{uploadErrorText(error, tx)}</InlineAlert>}
+       {pendingId && !busy && <div className="space-y-2 text-sm"><p className="break-all text-muted-foreground">{tx("studio.task.id")}{pendingId}</p><div className="flex flex-wrap gap-2">
+         <Button type="button" variant="outline" onClick={() => { void draftStore.check(submissionKey, request).then(task => { if (task) openTask(task) }) }}>{tx("studio.check.task.status")}</Button>
+         <Button type="button" variant="outline" onClick={() => { void draftStore.discard(submissionKey, request).then(cleared => { if (cleared && activeView.current) setError('') }) }}>{tx("studio.clear.this.import")}</Button>
+diff --git a/apps/web/src/plugin/builtin/workflow-run.tsx b/apps/web/src/plugin/builtin/workflow-run.tsx
+index a0592a2..b3f90ec 100644
+--- a/apps/web/src/plugin/builtin/workflow-run.tsx
++++ b/apps/web/src/plugin/builtin/workflow-run.tsx
+@@ -16,6 +16,8 @@ import { workflowDiagnostics, WorkflowDiagnostics } from './workflow-errors'
+ 
+ import { useActiveView, useObservableSource, usePendingUnload } from '../view-hooks'
+ import { StudioDraftStore, type WorkflowRunDraft } from '@/runtime/studio-draft'
++import { UploadMeter, uploadErrorText } from '@/runtime/upload-meter'
++import { formatBytes } from '@/runtime/upload-progress'
+ export type { WorkflowRunDraft } from '@/runtime/studio-draft'
+ 
+ export function WorkflowRun({ document, types, revision, afterInputs, prominent = false, submissionStore, draft, onDraftChange, onStarted, onLockChange, request, navigate, useSlot, useWorkflowResources }: { document: WorkflowDocument; types: NodeTypeDefinition[]; revision: number | null; afterInputs?: ReactNode; prominent?: boolean; submissionStore?: StudioDraftStore; draft?: WorkflowRunDraft; onDraftChange?: Dispatch<SetStateAction<WorkflowRunDraft>>; onStarted(): void; onLockChange(locked: boolean): void } & Bindings<'request' | 'navigate' | 'useSlot' | 'useWorkflowResources'>) {
+@@ -109,7 +111,8 @@ export function WorkflowRun({ document, types, revision, afterInputs, prominent
+   const status = <div className="space-y-3">
+     {document.nodes.map((node) => { const definition = nodeDefinition(node, types); return definition?.runtimeInputSchema ? <fieldset className="space-y-3" key={node.id}><legend className="mb-2 text-sm font-medium">{node.label || text(definition.label, language)}</legend><ConfigEditor useSlot={useSlot} ownerId={`runtime:${node.type}`} value={runtime[node.id] ?? {}} schema={definition.runtimeInputSchema} diagnostics={[]} readOnly={locked} onChange={(value) => { setDraft((current) => ({ ...current, runtimeByDocument: { ...current.runtimeByDocument, [document.id]: { ...current.runtimeByDocument[document.id], [node.id]: value } } })); setDiagnostics([]) }} /></fieldset> : null })}
+     <WorkflowResources resources={resources} types={types} disabled={locked} hideReady={prominent} />
+-    {error && <InlineAlert>{error}</InlineAlert>}
++    {submission?.busy && submission.upload && <UploadMeter snapshot={submission.upload} sending={tx('upload.sending')} importing={tx('upload.importing')} sent={tx('upload.sent')} noResume={tx('upload.no.resume')} speed={submission.upload.bytesPerSecond ? tx('upload.speed', { speed: formatBytes(submission.upload.bytesPerSecond) }) : ''} />}
++    {error && <InlineAlert>{uploadErrorText(error, tx)}</InlineAlert>}
+     <WorkflowDiagnostics diagnostics={submission?.failure ? workflowDiagnostics(submission.failure) : diagnostics} document={runDocument} types={types} />
+     {pending && !busy && <div className="space-y-3">
+       <p className="text-sm text-muted-foreground">{tx("workflow.run.check.whether.the.task.was.created.before.submitting.again")}</p>
+diff --git a/apps/web/src/plugin/harness-transport.test.ts b/apps/web/src/plugin/harness-transport.test.ts
+index 0dd197c..6ad5f26 100644
+--- a/apps/web/src/plugin/harness-transport.test.ts
++++ b/apps/web/src/plugin/harness-transport.test.ts
+@@ -8,9 +8,24 @@ it('uses the product RPC envelope and sends uploads through its dedicated authen
+   const signal = new AbortController().signal
+   await requestHarness('/api/v2/settings', { method: 'PATCH', body: JSON.stringify({ ui_language: 'zh' }), signal })
+   expect(fetch).toHaveBeenCalledWith('/api/youdub/v2', expect.objectContaining({ method: 'POST', credentials: 'include', signal, body: JSON.stringify({ method: 'PATCH', path: '/api/v2/settings', body: { ui_language: 'zh' } }) }))
++  const sent: { url?: string; body?: FormData; credentials?: boolean } = {}
++  class FakeXHR {
++    upload = {}
++    withCredentials = false
++    status = 200
++    responseText = JSON.stringify({ id: 'task' })
++    open(_method: string, url: string) { sent.url = url }
++    set body(value: FormData) { sent.body = value }
++    send(value: FormData) { sent.body = value; sent.credentials = this.withCredentials; queueMicrotask(() => (this as { onload?: () => void }).onload?.()) }
++    getResponseHeader() { return 'application/json' }
++  }
++  vi.stubGlobal('XMLHttpRequest', FakeXHR)
+   const body = new FormData(); body.set('request', '{}')
+   await requestHarness('/api/v2/tasks', { method: 'POST', body })
+-  expect(fetch).toHaveBeenLastCalledWith('/api/youdub/upload', expect.objectContaining({ body, credentials: 'include', headers: undefined }))
++  expect(sent.url).toBe('/api/youdub/upload')
++  expect(sent.body).toBe(body)
++  expect(sent.credentials).toBe(true)
++  expect(fetch).toHaveBeenCalledTimes(1)
+   await expect(requestHarness('https://external.invalid')).rejects.toThrow('Unsupported YouDub API path')
+   expect(fetch).toHaveBeenCalledTimes(2)
+ })
+diff --git a/apps/web/src/plugin/runtime/types.ts b/apps/web/src/plugin/runtime/types.ts
+index e70a388..f0fd066 100644
+--- a/apps/web/src/plugin/runtime/types.ts
++++ b/apps/web/src/plugin/runtime/types.ts
+@@ -1,3 +1,5 @@
+ /** Browser services expose snapshots and explicit actions without a rendering dependency. */
+ export interface Observable<T> { subscribe(listener: () => void): () => void; getSnapshot(): T }
+-export type Request = <T>(path: string, init?: RequestInit) => Promise<T>
++import type { UploadSnapshot } from '@/runtime/upload-progress'
++
++export type Request = <T>(path: string, init?: RequestInit & { onUploadProgress?: (snapshot: UploadSnapshot) => void }) => Promise<T>
+diff --git a/apps/web/src/runtime/studio-draft.ts b/apps/web/src/runtime/studio-draft.ts
+index 963dad3..5632dd3 100644
+--- a/apps/web/src/runtime/studio-draft.ts
++++ b/apps/web/src/runtime/studio-draft.ts
+@@ -3,10 +3,11 @@ import type { JsonObject } from '@/plugin/sdk'
+ import type { InputFile } from '@/plugin/builtin/workflow-launch'
+ import type { Request } from '@/plugin/runtime/types'
+ import type { TaskView } from '@/plugin/contracts'
++import type { UploadSnapshot } from '@/runtime/upload-progress'
+ 
+ export type WorkflowRunDraft = { selectedFiles: InputFile[]; sourceUrl: string; proxyPort?: number; runtimeByDocument: Record<string, Record<string, JsonObject>> }
+ export type ComposerDraft = { files: Record<string, File>; sourceUrl: string; config: JsonObject }
+-export type Submission = { id: string; path: string; body: FormData | string; busy: boolean; error: string; failure?: unknown; task?: TaskView }
++export type Submission = { id: string; path: string; body: FormData | string; busy: boolean; error: string; failure?: unknown; task?: TaskView; upload?: UploadSnapshot }
+ type StudioDraft = { selected: string; selectedGraph: string; draft: WorkflowRunDraft; overrides: Record<string, Record<string, JsonObject>>; composers: Record<string, ComposerDraft>; submissions: Record<string, Submission> }
+ const empty = (): StudioDraft => ({ selected: '', selectedGraph: '', draft: { selectedFiles: [], sourceUrl: '', runtimeByDocument: {} }, overrides: {}, composers: {}, submissions: {} })
+ 
+@@ -37,7 +38,10 @@ export class StudioDraftStore {
+       this.set('submissions', current => ({ ...current, [key]: submission! }))
+     }
+     if (submission.task) return submission.task
+-    return this.resolve(key, () => request<TaskView>(submission.path, { method: 'POST', body: submission.body }))
++    const upload = submission.body instanceof FormData
++      ? { onUploadProgress: (progress: UploadSnapshot) => this.set('submissions', current => current[key] ? { ...current, [key]: { ...current[key], upload: progress } } : current) }
++      : {}
++    return this.resolve(key, () => request<TaskView>(submission.path, { method: 'POST', body: submission.body, ...upload }))
+   }
+   async check(key: string, request: Request) {
+     const submission = this.getSnapshot().submissions[key]
+diff --git a/apps/web/src/runtime/upload-meter.tsx b/apps/web/src/runtime/upload-meter.tsx
+new file mode 100644
+index 0000000..c3fcaa6
+--- /dev/null
++++ b/apps/web/src/runtime/upload-meter.tsx
+@@ -0,0 +1,29 @@
++import type { UploadSnapshot } from './upload-progress'
++import { formatBytes } from './upload-progress'
++
++export function uploadErrorText(error: string, text: (key: string) => string): string {
++  if (error === 'UPLOAD_INTERRUPTED') return text('upload.interrupted')
++  if (error === 'UPLOAD_FAILED') return text('upload.failed')
++  return error
++}
++
++/** Transfer progress only. One hundred percent means the bytes were sent, not that dubbing finished. */
++export function UploadMeter({ snapshot, sending, importing, sent, noResume, speed }: {
++  snapshot: UploadSnapshot
++  sending: string
++  importing: string
++  sent: string
++  noResume: string
++  speed: string
++}) {
++  const percent = snapshot.total > 0 ? Math.min(100, Math.floor(snapshot.loaded * 100 / snapshot.total)) : null
++  return <div className="space-y-2" role="status">
++    <p className="text-sm">{snapshot.phase === 'importing' ? importing : sending}</p>
++    <progress className="h-2 w-full" aria-label={sending} value={snapshot.total > 0 ? snapshot.loaded : undefined} max={snapshot.total > 0 ? snapshot.total : undefined} />
++    <p className="text-xs text-muted-foreground">{formatBytes(snapshot.loaded)} / {snapshot.total > 0 ? formatBytes(snapshot.total) : '…'}{percent !== null ? ` (${percent}%)` : ''}</p>
++    {snapshot.files.length > 0 && <ul className="space-y-1 text-xs text-muted-foreground">{snapshot.files.map((file) => <li key={file.name}>{file.name} {formatBytes(file.loaded)} / {formatBytes(file.size)}</li>)}</ul>}
++    {snapshot.bytesPerSecond ? <p className="text-xs text-muted-foreground">{speed}</p> : null}
++    {snapshot.phase === 'uploading' && snapshot.total > 0 && snapshot.loaded >= snapshot.total ? <p className="text-xs">{sent}</p> : null}
++    <p className="text-xs text-muted-foreground">{noResume}</p>
++  </div>
++}
+diff --git a/apps/web/src/runtime/upload-progress.test.ts b/apps/web/src/runtime/upload-progress.test.ts
+new file mode 100644
+index 0000000..c653b8f
+--- /dev/null
++++ b/apps/web/src/runtime/upload-progress.test.ts
+@@ -0,0 +1,54 @@
++import { expect, it, vi } from 'vitest'
++import { attributeFiles, formFiles, snapshot, transferRate } from './upload-progress'
++import { xhrUpload } from './xhr-upload'
++
++it('attributes one multipart request across files without inventing a percent before the total is known', () => {
++  const body = new FormData()
++  body.set('request', '{}')
++  body.set('input.video', new File(['12345'], 'clip.mp4'))
++  body.set('input.subtitles', new File(['ab'], 'captions.srt'))
++  expect(formFiles(body).map((file) => file.name)).toEqual(['clip.mp4', 'captions.srt'])
++  expect(attributeFiles([{ name: 'clip.mp4', size: 5 }, { name: 'captions.srt', size: 2 }], 0, 0)).toEqual([
++    { name: 'clip.mp4', size: 5, loaded: 0 }, { name: 'captions.srt', size: 2, loaded: 0 },
++  ])
++  expect(attributeFiles([{ name: 'clip.mp4', size: 5 }, { name: 'captions.srt', size: 2 }], 8, 10)[0]).toMatchObject({ loaded: 5 })
++  expect(attributeFiles([{ name: 'clip.mp4', size: 5 }, { name: 'captions.srt', size: 2 }], 8, 10)[1]).toMatchObject({ loaded: 0 })
++  expect(attributeFiles([{ name: 'clip.mp4', size: 5 }, { name: 'captions.srt', size: 2 }], 10, 10)[1]).toMatchObject({ loaded: 2 })
++})
++
++it('shows speed only after half a second of real byte growth', () => {
++  expect(transferRate([{ at: 0, loaded: 0 }, { at: 100, loaded: 1000 }])).toBeUndefined()
++  expect(transferRate([{ at: 0, loaded: 0 }, { at: 500, loaded: 1000 }])).toBe(2000)
++  const view = snapshot([{ name: 'clip.mp4', size: 1000 }], 500, 1000, 'uploading', [{ at: 0, loaded: 0 }, { at: 500, loaded: 500 }])
++  expect(view.bytesPerSecond).toBe(1000)
++  expect(view.secondsRemaining).toBe(0.5)
++  expect(snapshot([{ name: 'clip.mp4', size: 1000 }], 1000, 1000, 'importing', [{ at: 0, loaded: 0 }, { at: 500, loaded: 1000 }]).bytesPerSecond).toBeUndefined()
++})
++
++it('moves from partial bytes to server import and fails a dropped connection without a resume offset', async () => {
++  const events: string[] = []
++  class FakeXHR {
++    upload: { onprogress?: (event: ProgressEvent) => void; onload?: () => void } = {}
++    status = 200
++    responseText = JSON.stringify({ id: 'task-1' })
++    withCredentials = false
++    open() {}
++    send() {
++      this.upload.onprogress?.({ lengthComputable: true, loaded: 40, total: 100 } as ProgressEvent)
++      this.upload.onload?.()
++      queueMicrotask(() => (this as { onload?: () => void }).onload?.())
++    }
++    getResponseHeader() { return 'application/json' }
++  }
++  vi.stubGlobal('XMLHttpRequest', FakeXHR)
++  const body = new FormData(); body.set('input.video', new File(['x'], 'clip.mp4'))
++  const result = await xhrUpload<{ id: string }>('/api/youdub/upload', body, { onProgress: (item) => events.push(item.phase) })
++  expect(result.id).toBe('task-1')
++  expect(events).toEqual(['uploading', 'importing'])
++
++  class FailedXHR extends FakeXHR {
++    send() { queueMicrotask(() => (this as { onerror?: () => void }).onerror?.()) }
++  }
++  vi.stubGlobal('XMLHttpRequest', FailedXHR)
++  await expect(xhrUpload('/api/youdub/upload', body)).rejects.toMatchObject({ code: 'UPLOAD_FAILED' })
++})
+diff --git a/apps/web/src/runtime/upload-progress.ts b/apps/web/src/runtime/upload-progress.ts
+new file mode 100644
+index 0000000..c7e9a5b
+--- /dev/null
++++ b/apps/web/src/runtime/upload-progress.ts
+@@ -0,0 +1,59 @@
++/** Byte progress for one whole-file multipart POST. There is no resume offset. */
++
++export type UploadFile = { name: string; size: number; loaded: number }
++export type UploadSnapshot = {
++  phase: 'uploading' | 'importing'
++  loaded: number
++  total: number
++  files: UploadFile[]
++  bytesPerSecond?: number
++  secondsRemaining?: number
++}
++
++export function formFiles(body: FormData): { name: string; size: number }[] {
++  const files: { name: string; size: number }[] = []
++  body.forEach((value, field) => {
++    if (typeof value !== 'string') files.push({ name: value.name || field, size: value.size })
++  })
++  return files
++}
++
++/** Attribute one request's sent bytes to files in form order, after the multipart envelope. */
++export function attributeFiles(files: { name: string; size: number }[], loaded: number, total: number): UploadFile[] {
++  const payload = files.reduce((sum, file) => sum + file.size, 0)
++  const overhead = total > 0 ? Math.max(0, total - payload) : 0
++  let rest = total > 0 ? Math.max(0, loaded - overhead) : 0
++  return files.map((file) => {
++    const sent = Math.min(file.size, rest)
++    rest -= sent
++    return { name: file.name, size: file.size, loaded: sent }
++  })
++}
++
++export function transferRate(samples: { at: number; loaded: number }[]): number | undefined {
++  if (samples.length < 2) return undefined
++  const first = samples[0]
++  const last = samples[samples.length - 1]
++  const seconds = (last.at - first.at) / 1000
++  if (seconds < 0.5 || last.loaded <= first.loaded) return undefined
++  return (last.loaded - first.loaded) / seconds
++}
++
++export function snapshot(files: { name: string; size: number }[], loaded: number, total: number, phase: UploadSnapshot['phase'], samples: { at: number; loaded: number }[]): UploadSnapshot {
++  const bytesPerSecond = phase === 'uploading' ? transferRate(samples) : undefined
++  const remaining = total > loaded && bytesPerSecond ? (total - loaded) / bytesPerSecond : undefined
++  return {
++    phase, loaded, total, files: attributeFiles(files, loaded, total),
++    ...(bytesPerSecond ? { bytesPerSecond } : {}),
++    ...(remaining !== undefined && Number.isFinite(remaining) ? { secondsRemaining: remaining } : {}),
++  }
++}
++
++export function formatBytes(value: number): string {
++  if (!Number.isFinite(value) || value < 0) return '0 B'
++  const units = ['B', 'KB', 'MB', 'GB']
++  let size = value
++  let unit = 0
++  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1 }
++  return `${unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`
++}
+diff --git a/apps/web/src/runtime/xhr-upload.ts b/apps/web/src/runtime/xhr-upload.ts
+new file mode 100644
+index 0000000..35fab79
+--- /dev/null
++++ b/apps/web/src/runtime/xhr-upload.ts
+@@ -0,0 +1,47 @@
++import { responseBody } from './http'
++import { formFiles, snapshot, type UploadSnapshot } from './upload-progress'
++
++export class UploadError extends Error {
++  readonly code: 'UPLOAD_INTERRUPTED' | 'UPLOAD_FAILED'
++  constructor(message: string, code: 'UPLOAD_INTERRUPTED' | 'UPLOAD_FAILED') {
++    super(message)
++    this.name = 'UploadError'
++    this.code = code
++  }
++}
++
++/** Send one multipart body and report bytes the browser has handed to the connection. */
++export function xhrUpload<T>(url: string, body: FormData, init: { signal?: AbortSignal; onProgress?: (snapshot: UploadSnapshot) => void } = {}): Promise<T> {
++  const files = formFiles(body)
++  const samples: { at: number; loaded: number }[] = []
++  let knownTotal = 0
++  const emit = (phase: UploadSnapshot['phase'], loaded: number, total: number) => {
++    if (total > 0) knownTotal = total
++    samples.push({ at: performance.now(), loaded })
++    while (samples.length > 2 && samples[samples.length - 1].at - samples[0].at > 5000) samples.shift()
++    init.onProgress?.(snapshot(files, loaded, total, phase, samples))
++  }
++  return new Promise((resolve, reject) => {
++    const xhr = new XMLHttpRequest()
++    xhr.open('POST', url)
++    xhr.withCredentials = true
++    xhr.upload.onprogress = (event) => {
++      if (!event.lengthComputable) {
++        init.onProgress?.({ phase: 'uploading', loaded: event.loaded, total: 0, files: files.map((file) => ({ ...file, loaded: 0 })) })
++        return
++      }
++      emit('uploading', event.loaded, event.total)
++    }
++    xhr.upload.onload = () => emit('importing', knownTotal, knownTotal)
++    xhr.onload = () => {
++      const response = new Response(xhr.responseText, { status: xhr.status, headers: { 'content-type': xhr.getResponseHeader('content-type') ?? '' } })
++      responseBody<T>(response).then(resolve, reject)
++    }
++    xhr.onerror = () => reject(new UploadError('UPLOAD_FAILED', 'UPLOAD_FAILED'))
++    xhr.onabort = () => reject(new UploadError('UPLOAD_INTERRUPTED', 'UPLOAD_INTERRUPTED'))
++    const abort = () => xhr.abort()
++    init.signal?.addEventListener('abort', abort, { once: true })
++    xhr.send(body)
++  })
++}
++
