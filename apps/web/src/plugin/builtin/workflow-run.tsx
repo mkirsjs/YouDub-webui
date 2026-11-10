@@ -16,6 +16,8 @@ import { workflowDiagnostics, WorkflowDiagnostics } from './workflow-errors'
 
 import { useActiveView, useObservableSource, usePendingUnload } from '../view-hooks'
 import { StudioDraftStore, type WorkflowRunDraft } from '@/runtime/studio-draft'
+import { UploadMeter, uploadErrorText } from '@/runtime/upload-meter'
+import { formatBytes } from '@/runtime/upload-progress'
 export type { WorkflowRunDraft } from '@/runtime/studio-draft'
 
 export function WorkflowRun({ document, types, revision, afterInputs, prominent = false, submissionStore, draft, onDraftChange, onStarted, onLockChange, request, navigate, useSlot, useWorkflowResources }: { document: WorkflowDocument; types: NodeTypeDefinition[]; revision: number | null; afterInputs?: ReactNode; prominent?: boolean; submissionStore?: StudioDraftStore; draft?: WorkflowRunDraft; onDraftChange?: Dispatch<SetStateAction<WorkflowRunDraft>>; onStarted(): void; onLockChange(locked: boolean): void } & Bindings<'request' | 'navigate' | 'useSlot' | 'useWorkflowResources'>) {
@@ -109,7 +111,8 @@ export function WorkflowRun({ document, types, revision, afterInputs, prominent 
   const status = <div className="space-y-3">
     {document.nodes.map((node) => { const definition = nodeDefinition(node, types); return definition?.runtimeInputSchema ? <fieldset className="space-y-3" key={node.id}><legend className="mb-2 text-sm font-medium">{node.label || text(definition.label, language)}</legend><ConfigEditor useSlot={useSlot} ownerId={`runtime:${node.type}`} value={runtime[node.id] ?? {}} schema={definition.runtimeInputSchema} diagnostics={[]} readOnly={locked} onChange={(value) => { setDraft((current) => ({ ...current, runtimeByDocument: { ...current.runtimeByDocument, [document.id]: { ...current.runtimeByDocument[document.id], [node.id]: value } } })); setDiagnostics([]) }} /></fieldset> : null })}
     <WorkflowResources resources={resources} types={types} disabled={locked} hideReady={prominent} />
-    {error && <InlineAlert>{error}</InlineAlert>}
+    {submission?.busy && submission.upload && <UploadMeter snapshot={submission.upload} sending={tx('upload.sending')} importing={tx('upload.importing')} sent={tx('upload.sent')} noResume={tx('upload.no.resume')} speed={submission.upload.bytesPerSecond ? tx('upload.speed', { speed: formatBytes(submission.upload.bytesPerSecond) }) : ''} />}
+    {error && <InlineAlert>{uploadErrorText(error, tx)}</InlineAlert>}
     <WorkflowDiagnostics diagnostics={submission?.failure ? workflowDiagnostics(submission.failure) : diagnostics} document={runDocument} types={types} />
     {pending && !busy && <div className="space-y-3">
       <p className="text-sm text-muted-foreground">{tx("workflow.run.check.whether.the.task.was.created.before.submitting.again")}</p>

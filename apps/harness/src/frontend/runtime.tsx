@@ -2,20 +2,23 @@ import React, { createContext, useContext, useEffect, useMemo, useSyncExternalSt
 import { QueryClient } from '../../../web/src/plugin/runtime/query'
 import { WorkflowResourceChecks, changesResources, resourceKey } from '../../../web/src/plugin/runtime/workflow-resources'
 import { responseBody } from '../../../web/src/runtime/http'
+import { xhrUpload } from '../../../web/src/runtime/xhr-upload'
+import type { UploadSnapshot } from '../../../web/src/runtime/upload-progress'
 import { StudioDraftStore } from '../../../web/src/runtime/studio-draft'
 import type { Request } from '../../../web/src/plugin/runtime/types'
 const Features = createContext<any>(null)
 export const FeatureProvider = Features.Provider
 export function useFeatures() { const value = useContext(Features); if (!value) throw new Error('YouDub feature bindings are unavailable'); return value }
 export const domainSlots = ['config.editors','task.detail.panels','task.detail.actions','workflow.node.editors','workflow.node.details']
-export async function requestHarness<T>(path:string, init:RequestInit = {}):Promise<T> {
+export async function requestHarness<T>(path:string, init:RequestInit & { onUploadProgress?: (snapshot: UploadSnapshot) => void } = {}):Promise<T> {
     if (!path.startsWith('/api/')) throw new Error(`Unsupported YouDub API path: ${path}`)
     const method = (init.method ?? 'GET').toUpperCase()
     const multipart = init.body instanceof FormData
-    const response = await fetch(multipart ? '/api/youdub/upload' : '/api/youdub/v2', {
+    if (multipart) return xhrUpload<T>('/api/youdub/upload', init.body, { signal: init.signal ?? undefined, onProgress: init.onUploadProgress })
+    const response = await fetch('/api/youdub/v2', {
       method:'POST', signal:init.signal, credentials:'include',
-      headers:multipart ? undefined : { 'content-type':'application/json' },
-      body:multipart ? init.body : JSON.stringify({ method, path, ...(init.body ? { body:typeof init.body === 'string' ? JSON.parse(init.body) : init.body } : {}) }),
+      headers:{ 'content-type':'application/json' },
+      body:JSON.stringify({ method, path, ...(init.body ? { body:typeof init.body === 'string' ? JSON.parse(init.body) : init.body } : {}) }),
     })
     return responseBody<T>(response)
 }
