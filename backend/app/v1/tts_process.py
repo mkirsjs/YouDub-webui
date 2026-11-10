@@ -366,9 +366,10 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_wav_path=clip["reference_path"], prompt_text=clip["reference_text"],
                 normalize=False, denoise=False, retry_badcase=False,
             ))
+            peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
             if (waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all()
-                    or np.max(np.abs(waveform)) > 1):
-                raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
+                    or peak > 1 or peak < 1e-3):
+                raise ValueError("VoxCPM2 returned an empty, silent, or invalid mono waveform")
             destination = Path(clip["output_path"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             partial = destination.with_suffix(".partial.wav")

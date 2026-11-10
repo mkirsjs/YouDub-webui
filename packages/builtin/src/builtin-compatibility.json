@@ -1,37 +1,43 @@
 {
   "youdub.download": {
-    "integrity": "sha256:3c640d5837dff4a90b64ed4cafddd54e512973ca16c796693a177cf2d7c6dda4",
+    "integrity": "sha256:19e3cfb28f109e6a33fdb3d899e3f8ea7e9482c0e3e678a35f53030b2c9fbb72",
     "previous": [
+      "sha256:3c640d5837dff4a90b64ed4cafddd54e512973ca16c796693a177cf2d7c6dda4",
       "sha256:f9cd5624128799de3653e486e1666e70b3a06c84bfbc2b40c5305a5334edf950"
     ]
   },
   "youdub.media": {
-    "integrity": "sha256:320b5cb56bbeabf4f3182b2aefd6a4d3d0bb587db218b79635748629ff8870ef",
+    "integrity": "sha256:21b6568dab7bdf14bfb18d2288290afe7bb76857774e8ce20e1d369b9e756d7e",
     "previous": [
+      "sha256:320b5cb56bbeabf4f3182b2aefd6a4d3d0bb587db218b79635748629ff8870ef",
       "sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3"
     ]
   },
   "whisper": {
-    "integrity": "sha256:d2432da3df9de2091d1d07f833514f0df64b5dd6ac6fdf363dd687c883159d08",
+    "integrity": "sha256:f68a7161eec31eaf9617c8d86d139ba44f830e845221f6e6b4cb452bed54a405",
     "previous": [
+      "sha256:d2432da3df9de2091d1d07f833514f0df64b5dd6ac6fdf363dd687c883159d08",
       "sha256:e04783bad9df83f72b801c0cdc0c40aa4cb18e4761eb5f35cb4af0e9a7a87c15"
     ]
   },
   "voxcpm": {
-    "integrity": "sha256:611aa179d86c15dfa7e87436dda664f69aa279b829289a83040d946fc0fa6d75",
+    "integrity": "sha256:326e5b670cd6b3a9a43e471b8d62f60f1dc64cec2364434223f68bda95e6e87c",
     "previous": [
+      "sha256:611aa179d86c15dfa7e87436dda664f69aa279b829289a83040d946fc0fa6d75",
       "sha256:ef4d0a6c1df36e15d890cd2290e0fc1f0e540294a47fd40177d6221d3ba71c6f"
     ]
   },
   "demucs": {
-    "integrity": "sha256:4897b3e4c21774a0cc8f076a0a502229ff6f213efe67eed1fb37eadb74e6bce2",
+    "integrity": "sha256:91d4d95d006844fe9056aaf48e028110b9010f53e508132affab99741e0baecc",
     "previous": [
+      "sha256:4897b3e4c21774a0cc8f076a0a502229ff6f213efe67eed1fb37eadb74e6bce2",
       "sha256:cd94b870dfcf23872842631546825dbd13e48486408a377c6511d155df3e9526"
     ]
   },
   "qwen_forced_aligner": {
-    "integrity": "sha256:1e9787ad6d2fa062b23a820e9bc7dbd7d87cf125e47c651537ddb0f41c3bf134",
+    "integrity": "sha256:3a7e1833af3420b91556b28c944f2bcb3b71f7600f32a5f5dfa86ff7ab0aa225",
     "previous": [
+      "sha256:1e9787ad6d2fa062b23a820e9bc7dbd7d87cf125e47c651537ddb0f41c3bf134",
       "sha256:922d210897cf2df75d7e26d0e02ae6ffbd997e986e0cd50c7cd7f0d6a799375b"
     ]
   },

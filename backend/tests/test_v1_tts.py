@@ -400,7 +400,10 @@ def test_child_missing_model_package_is_explicit(context, monkeypatch, capsys):
     assert not any(Path(clip["output_path"]).exists() for clip in clips)
 
 
-@pytest.mark.parametrize("waveform", [np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100))])
+@pytest.mark.parametrize("waveform", [
+    np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100)),
+    np.zeros(4800), np.full(4800, 1e-4),
+])
 def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys, waveform):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")

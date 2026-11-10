@@ -107,6 +107,19 @@ def test_real_mix_uses_only_separated_background_and_keeps_its_tail(context):
     assert np.max(abs(samples)) < 1
 
 
+def test_real_mix_rejects_a_silent_clip_before_writing_the_mix(context):
+    require_ffmpeg()
+    path = context.work_dir / "tts/000002.wav"
+    info = sf.info(path)
+    sf.write(path, np.zeros(info.frames, dtype="float32"), info.samplerate, subtype="PCM_16")
+    write_manifest(context)
+    with pytest.raises(ApiError) as error:
+        mix.run(context, lambda value, message: None)
+    assert error.value.content["error"]["code"] == "INVALID_PROVIDER_RESULT"
+    assert "silent" in error.value.content["error"]["message"]
+    assert not (context.work_dir / "mixed.wav").exists()
+
+
 def test_real_mix_fails_on_speech_overflow_without_trimming(context):
     require_ffmpeg()
     write_tone(context.work_dir / "tts/000001.wav", 9000, 440)

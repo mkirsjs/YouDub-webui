@@ -104,6 +104,70 @@ index 77bff94..925b848 100644
 +  }
 +})
 +
+diff --git a/artifacts/automatic-dub-deploy.md b/artifacts/automatic-dub-deploy.md
+new file mode 100644
+index 0000000..a344136
+--- /dev/null
++++ b/artifacts/automatic-dub-deploy.md
+@@ -0,0 +1,58 @@
++# Automatic dubbing on the current host
++
++Baseline: `44a98e30c4108cc6bc05cce1b10f96db5fafda6d`. This patch does not change the public origin, the launch-token file, nginx, or task `9280e54b-89e9-42e4-b871-b96ca69734fe`.
++
++## What the author actually ships
++
++`README.md` (author tree `a270415`, still the product text) says the desk imports a video, recognizes speech, translates it, clones each sentence, and can keep separated background. The first-run step is explicit: add a provider, an API key, and a translation model (`README.md` lines 100 and 129). Translation is a Harness model call, not a weight file in this repo.
++
++The built-in dubbing graph is `packages/builtin/src/workflow-templates/source-clone-dubbing.json`, published as `youdub.dubbing` by `packages/builtin/src/workflow-templates.ts`. Its nodes are prepare, Demucs `htdemucs`, Whisper `tiny`, translate, reference, VoxCPM2 `source_clone`, mix with `keepBackground: true`, and export without burned-in subtitles. `packages/builtin/src/setup-models.json` lists local files for Whisper tiny, VoxCPM2, Demucs htdemucs, and Qwen3 Forced Aligner 0.6B. It lists no translation weights.
++
++`apps/harness/src/backend/llm.mjs` `translateWithHarness` sends each batch to the configured provider and requires every segment id back. The author's recorded runs use an OpenAI-compatible endpoint (`doubao-seed-evolving` in `docs/validation/mvp-runtime.md`) with `max_completion_tokens` 65535. There is no offline translator in the execution code. A task cannot invent the Chinese lines.
++
++Whisper may keep a `speaker_id` when the recognizer returns one (`backend/app/v1/asr.py`). Stock Whisper tiny does not diarize. `backend/app/v1/mix.py` rejects overlapping source segments with `UNSUPPORTED_OVERLAPPING_SPEECH`. This build does not claim multi-speaker dubbing or a perfect vocal split. Demucs `htdemucs` is one vocals stem and one background stem. Mix adds that background at gain `0.3`.
++
++## What this deployment already changed
++
++HTTPS exact origin, the mode-0600 launch token, CUDA placement for Demucs and VoxCPM, CPU `libx264` because NVENC session creation failed, and receipt resume are on `44a98e30`. The long task used imported SRT files because no translation credential was configured. That import path is `youdub.importSubtitles`. It is not the default dubbing graph.
++
++Attempt 2 of `9280e54b` already finished 129 clips, mix, and export. Do not retry it, delete it, or replace its wavs. The backup stays untouched.
++
++## Silence is now a failure
++
++A generated clip whose peak is below `1e-3` (-60 dBFS), or an adjusted mix clip that quiet, raises `INVALID_PROVIDER_RESULT` and does not write the mix. Reused receipt bytes are not rewritten. The scheduler still does not trim, fade, or overlap speech. `backend/app/v1/mix.py` writes each complete clip with a hard sample boundary and can leave a gap when a clip is shorter than the source interval. Those gaps, a reference slice that includes a breath, and residual voice in the background stem are the code paths that can sound like a break at a joint. This patch does not cut heads or tails to chase that symptom. No private audio was available here, and this VM has no GPU, so this is not a listening test.
++
++## Apply
++
++On `44a98e30`:
++
++```sh
++git apply --check artifacts/youdub-silence-gate-since-44a98e30.patch
++git apply artifacts/youdub-silence-gate-since-44a98e30.patch
++npm --prefix apps/harness run build
++```
++
++Restart only `youdub-host` through the existing supervisor config. Keep `YOUDUB_PUBLIC_ORIGIN` and `YOUDUB_LAUNCH_TOKEN_FILE=/var/lib/youdub/launch-token`. Do not rebuild the framework unless `vendor/deepseek-harness` changes. Do not open ports 8888 or 8889.
++
++To run the author's dubbing graph, the host still needs an OpenAI-compatible translation endpoint that the machine can reach, a stored API key, and a model whose output limit is at least 65535 tokens. This patch does not add a key, a tunnel, or a local translation model. Until that endpoint exists, a new video cannot produce Chinese speech. Importing two SRT files remains the only path that does not call a translator.
++
++## Rollback
++
++```sh
++git checkout 44a98e30c4108cc6bc05cce1b10f96db5fafda6d -- \
++  backend/app/v1/audio.py backend/app/v1/mix.py backend/app/v1/tts_process.py \
++  packages/builtin/src/builtin-compatibility.json \
++  packages/builtin/test/builtin-integrity.test.ts \
++  backend/tests/test_v1_mix.py backend/tests/test_v1_tts.py
++npm --prefix apps/harness run build
++```
++
++Restart `youdub-host`. Leave the finished task, its backup, and the token file as they are.
++
++## Read-only checks for the operator
++
++No private media needs to be copied here. Useful reads, if a joint is investigated later:
++
++- `find` the Whisper and Qwen directories and print file names and sizes only.
++- From the finished task's `alignment.json`, the `dubbed_start_ms` and `dubbed_end_ms` of two adjacent cues and the gap between them.
++- Whether a translation provider credential is absent. Do not print the key.
 diff --git a/artifacts/public-origin-deploy.md b/artifacts/public-origin-deploy.md
 index 0ee33ba..11f3425 100644
 --- a/artifacts/public-origin-deploy.md
@@ -229,6 +293,21 @@ index 0000000..7811eea
 +git apply --check artifacts/youdub-since-a270415.patch
 +git apply artifacts/youdub-since-a270415.patch
 +```
+diff --git a/backend/app/v1/audio.py b/backend/app/v1/audio.py
+index 18e3ea6..369eed5 100644
+--- a/backend/app/v1/audio.py
++++ b/backend/app/v1/audio.py
+@@ -3,6 +3,10 @@
+ from pathlib import Path
+ from .errors import ApiError
+ 
++# A whole clip quieter than -60 dBFS has no usable speech. This rejects digital
++# silence. It does not trim, fade, or overlap a clip.
++SPEECH_PEAK_FLOOR = 1e-3
++
+ 
+ def audio_info(path: Path, *, stage: str):
+     if not path.is_file() or path.stat().st_size == 0:
 diff --git a/backend/app/v1/export.py b/backend/app/v1/export.py
 index 4d4bc81..7bf8320 100644
 --- a/backend/app/v1/export.py
@@ -293,6 +372,27 @@ index 3864cb7..450caf1 100644
              check_cancel()
          except BaseException:
              if process.poll() is None:
+diff --git a/backend/app/v1/mix.py b/backend/app/v1/mix.py
+index d0f1536..43b01e4 100644
+--- a/backend/app/v1/mix.py
++++ b/backend/app/v1/mix.py
+@@ -21,6 +21,7 @@ import soundfile as sf
+ 
+ from ..config import ffmpeg_binary
+ from . import media
++from .audio import SPEECH_PEAK_FLOOR
+ from .audio_segments import AlignedSegment, Alignment, SpeechClip, read_speech_clips
+ from .errors import ApiError
+ from .segments import read_transcript
+@@ -116,6 +117,8 @@ def run(context: StageContext, progress: Callable[[float | None, str], None]) ->
+         start_ms = start_sample * 1000 / SAMPLE_RATE
+         local = min(1.25, max(0.75, (segment.end_ms - start_ms) / (raw_duration * base)))
+         samples = _decode(context, path, adjusted / f"{index + 1:04d}.wav", duration_ratio=base * local)
++        if float(np.max(np.abs(samples))) < SPEECH_PEAK_FLOOR:
++            raise _invalid(f"Adjusted speech clip {index + 1} is silent.")
+         end_sample = start_sample + len(samples)
+         planned.append([start_sample, len(samples)])
+         previous_end = end_sample
 diff --git a/backend/app/v1/separate.py b/backend/app/v1/separate.py
 index 8d41b56..196286c 100644
 --- a/backend/app/v1/separate.py
@@ -431,7 +531,7 @@ index 94ac9f1..dd632d8 100644
          try:
              error = json.loads(result.stderr.strip().splitlines()[-1])
 diff --git a/backend/app/v1/tts_process.py b/backend/app/v1/tts_process.py
-index 267a102..82e30c0 100644
+index 267a102..fb4a5a4 100644
 --- a/backend/app/v1/tts_process.py
 +++ b/backend/app/v1/tts_process.py
 @@ -1,11 +1,19 @@
@@ -752,7 +852,7 @@ index 267a102..82e30c0 100644
      try:
          import numpy as np
          import soundfile as sf
-@@ -64,11 +343,24 @@ def main(argv: list[str] | None = None) -> int:
+@@ -64,20 +343,47 @@ def main(argv: list[str] | None = None) -> int:
          sample_rate = model.tts_model.sample_rate
          if type(sample_rate) is not int or sample_rate <= 0:
              raise ValueError("Invalid model output sample rate")
@@ -778,11 +878,15 @@ index 267a102..82e30c0 100644
              waveform = np.asarray(model.generate(
                  text=clip["text"], reference_wav_path=clip["reference_path"],
                  prompt_wav_path=clip["reference_path"], prompt_text=clip["reference_text"],
-@@ -77,7 +369,20 @@ def main(argv: list[str] | None = None) -> int:
+                 normalize=False, denoise=False, retry_badcase=False,
+             ))
++            peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
              if (waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all()
-                     or np.max(np.abs(waveform)) > 1):
-                 raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
+-                    or np.max(np.abs(waveform)) > 1):
+-                raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
 -            sf.write(clip["output_path"], waveform, sample_rate, format="WAV", subtype="PCM_16")
++                    or peak > 1 or peak < 1e-3):
++                raise ValueError("VoxCPM2 returned an empty, silent, or invalid mono waveform")
 +            destination = Path(clip["output_path"])
 +            destination.parent.mkdir(parents=True, exist_ok=True)
 +            partial = destination.with_suffix(".partial.wav")
@@ -947,6 +1051,30 @@ index 559e169..16099d5 100644
      assert all(path.parent == context.work_dir / "output" for path in result.output_files.values())
  
  
+diff --git a/backend/tests/test_v1_mix.py b/backend/tests/test_v1_mix.py
+index a3022d9..73bf5f4 100644
+--- a/backend/tests/test_v1_mix.py
++++ b/backend/tests/test_v1_mix.py
+@@ -107,6 +107,19 @@ def test_real_mix_uses_only_separated_background_and_keeps_its_tail(context):
+     assert np.max(abs(samples)) < 1
+ 
+ 
++def test_real_mix_rejects_a_silent_clip_before_writing_the_mix(context):
++    require_ffmpeg()
++    path = context.work_dir / "tts/000002.wav"
++    info = sf.info(path)
++    sf.write(path, np.zeros(info.frames, dtype="float32"), info.samplerate, subtype="PCM_16")
++    write_manifest(context)
++    with pytest.raises(ApiError) as error:
++        mix.run(context, lambda value, message: None)
++    assert error.value.content["error"]["code"] == "INVALID_PROVIDER_RESULT"
++    assert "silent" in error.value.content["error"]["message"]
++    assert not (context.work_dir / "mixed.wav").exists()
++
++
+ def test_real_mix_fails_on_speech_overflow_without_trimming(context):
+     require_ffmpeg()
+     write_tone(context.work_dir / "tts/000001.wav", 9000, 440)
 diff --git a/backend/tests/test_v1_separate.py b/backend/tests/test_v1_separate.py
 index 4094a78..07865f1 100644
 --- a/backend/tests/test_v1_separate.py
@@ -1145,10 +1273,22 @@ index 4094a78..07865f1 100644
      monkeypatch.setitem(sys.modules, "demucs", None)
      args = []
 diff --git a/backend/tests/test_v1_tts.py b/backend/tests/test_v1_tts.py
-index a49c7cf..5d63c34 100644
+index a49c7cf..6071018 100644
 --- a/backend/tests/test_v1_tts.py
 +++ b/backend/tests/test_v1_tts.py
-@@ -417,3 +417,231 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
+@@ -400,7 +400,10 @@ def test_child_missing_model_package_is_explicit(context, monkeypatch, capsys):
+     assert not any(Path(clip["output_path"]).exists() for clip in clips)
+ 
+ 
+-@pytest.mark.parametrize("waveform", [np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100))])
++@pytest.mark.parametrize("waveform", [
++    np.array([]), np.array([float("nan")]), np.array([1.1]), np.zeros((2, 100)),
++    np.zeros(4800), np.full(4800, 1e-4),
++])
+ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys, waveform):
+     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+@@ -417,3 +420,231 @@ def test_child_invalid_model_output_is_not_retried(context, monkeypatch, capsys,
      assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["code"] == "INVALID_PROVIDER_RESULT"
      assert len(calls) == 1
      assert not any(Path(clip["output_path"]).exists() for clip in clips)
@@ -1394,26 +1534,27 @@ index c445495..033e045 100644
          segments = []
          for clip in clips:
 diff --git a/packages/builtin/src/builtin-compatibility.json b/packages/builtin/src/builtin-compatibility.json
-index 52a7c23..2ee1d4b 100644
+index 52a7c23..070d813 100644
 --- a/packages/builtin/src/builtin-compatibility.json
 +++ b/packages/builtin/src/builtin-compatibility.json
-@@ -1,64 +1,38 @@
+@@ -1,64 +1,44 @@
  {
    "youdub.download": {
 -    "integrity": "sha256:9ba6df2aafe976e698aff1227ecce843b5be3361f559e517fd327f2079b7f998",
-+    "integrity": "sha256:3c640d5837dff4a90b64ed4cafddd54e512973ca16c796693a177cf2d7c6dda4",
++    "integrity": "sha256:19e3cfb28f109e6a33fdb3d899e3f8ea7e9482c0e3e678a35f53030b2c9fbb72",
      "previous": [
 -      "sha256:d83a6443bd483df945476b09748b83fb030d80173670988af424c008bdbdc65f",
 -      "sha256:57345b32f0396e9a8351c81e0d24a9a9dbb5c03628635aeed71c3d9b7d52c796",
 -      "sha256:e40344408260dc45da5b6879fecb74b0824cc05d803f644e66058b770d33a978",
 -      "sha256:ce045451f5cae25553b111072e2773b5c30354cb2400f5ef9a7e76ef9a06b9e8",
 -      "sha256:6664e2e57500616b8fe82e54faddcf8e7f73f81d3ff8693c27b9532bb0fc2d3d"
++      "sha256:3c640d5837dff4a90b64ed4cafddd54e512973ca16c796693a177cf2d7c6dda4",
 +      "sha256:f9cd5624128799de3653e486e1666e70b3a06c84bfbc2b40c5305a5334edf950"
      ]
    },
    "youdub.media": {
 -    "integrity": "sha256:f26229b56cd3b2d238998e0da85c0162a9bd4709bdd2c2b07928bb01a960c866",
-+    "integrity": "sha256:320b5cb56bbeabf4f3182b2aefd6a4d3d0bb587db218b79635748629ff8870ef",
++    "integrity": "sha256:21b6568dab7bdf14bfb18d2288290afe7bb76857774e8ce20e1d369b9e756d7e",
      "previous": [
 -      "sha256:7b897c400cc36f910dd1a16b9e30049a2ce0d0a9b00490ab759f435bd2974ff2",
 -      "sha256:145291a927c8ca2c712fcaeef9e7295bd92bbc441e75e8c0858f26cd6aaca79b",
@@ -1421,24 +1562,26 @@ index 52a7c23..2ee1d4b 100644
 -      "sha256:e76c52b30b90ef51072da8d431ad3b032eeb7859af1020307762ae07dc823c89",
 -      "sha256:e854373ee10f056854a96e9c77c188c50ba0bd0b0194de6d8b92b87290af220d",
 -      "sha256:dd73c3919326e592dfa3049196d0f827568b6c0f36cf69cb7b3e14a4c9138e39"
++      "sha256:320b5cb56bbeabf4f3182b2aefd6a4d3d0bb587db218b79635748629ff8870ef",
 +      "sha256:acecd499efebde2036412267c558d8dc0ab4d690790995218fcab2c63ab011f3"
      ]
    },
    "whisper": {
 -    "integrity": "sha256:7776c0fcb521227636f8f19f96345b8704b3bdf625c82d3e2da51ac2d1b42dfa",
-+    "integrity": "sha256:d2432da3df9de2091d1d07f833514f0df64b5dd6ac6fdf363dd687c883159d08",
++    "integrity": "sha256:f68a7161eec31eaf9617c8d86d139ba44f830e845221f6e6b4cb452bed54a405",
      "previous": [
 -      "sha256:664a95083ee884a1b2d715aae956f7be92ff0b953de7b46dfd672f17742688c1",
 -      "sha256:95ec8d06fdb07288d08765ca02acf8a26c920addfed85ad195937bb45c322a6e",
 -      "sha256:9c4254c5e38468336005e501f76d74b368c94b12e23e608a77faf2ac3e09c1ab",
 -      "sha256:697bcb03960243151b0cf1ff730214f2ca87b1e633e58657280c67443e69c434",
 -      "sha256:1db02163341ec853a13230181b7a739abfed2b1de1cb9309c1cf07feeb1183f2"
++      "sha256:d2432da3df9de2091d1d07f833514f0df64b5dd6ac6fdf363dd687c883159d08",
 +      "sha256:e04783bad9df83f72b801c0cdc0c40aa4cb18e4761eb5f35cb4af0e9a7a87c15"
      ]
    },
    "voxcpm": {
 -    "integrity": "sha256:3f2bde9c926dd512dd9e00009d51456f4e5b0409925ecbd7727a18d7f18576d2",
-+    "integrity": "sha256:611aa179d86c15dfa7e87436dda664f69aa279b829289a83040d946fc0fa6d75",
++    "integrity": "sha256:326e5b670cd6b3a9a43e471b8d62f60f1dc64cec2364434223f68bda95e6e87c",
      "previous": [
 -      "sha256:787f1fd47b1de0191d4596de4910f0e1d94239e4967c93b5c99b72dfa19a04d7",
 -      "sha256:6a38efe382f7f5c9bbc274a121d0fc1a53419ea48eb26b6c3fd85f7966834473",
@@ -1446,36 +1589,39 @@ index 52a7c23..2ee1d4b 100644
 -      "sha256:90a7ed922d2549377fec708394dbfa591e70a4cbf3a2e941d69ce66466feeac0",
 -      "sha256:8dc2539c1f02bddd16d985b226873e96de4736b58b9558b54ce953f7b667d542",
 -      "sha256:c9f09cd6d171430c457e692fe25f63717d29a6976bad5ab1a9b45cd0fab99b4b"
++      "sha256:611aa179d86c15dfa7e87436dda664f69aa279b829289a83040d946fc0fa6d75",
 +      "sha256:ef4d0a6c1df36e15d890cd2290e0fc1f0e540294a47fd40177d6221d3ba71c6f"
      ]
    },
    "demucs": {
 -    "integrity": "sha256:3b7721e07ba5b2ee81cf795866c3ae60ab4713152bc8fdde58a059d9a21eb94b",
-+    "integrity": "sha256:4897b3e4c21774a0cc8f076a0a502229ff6f213efe67eed1fb37eadb74e6bce2",
++    "integrity": "sha256:91d4d95d006844fe9056aaf48e028110b9010f53e508132affab99741e0baecc",
      "previous": [
 -      "sha256:591c17d568760da4a1125227e1598217126589535448f1d0480205c4ff6cb61d",
 -      "sha256:df934879eb2d5a671ac1020ee0d0d7e0d97d184c7db3689cd3e0300ddfb6f1c9",
 -      "sha256:c5e628df7371d109bd9a29e66f4b86e2262eea6ac77e80200dc3bf8e971af315",
 -      "sha256:88664eeb3b05ae32b2711901052356cf0d7ac389959253dfbdb5f46837a6faac",
 -      "sha256:86ec6bd14a35163b4b4a9998b4ed14306a44f4c1fa992251c4cff5fa8283dc7c"
++      "sha256:4897b3e4c21774a0cc8f076a0a502229ff6f213efe67eed1fb37eadb74e6bce2",
 +      "sha256:cd94b870dfcf23872842631546825dbd13e48486408a377c6511d155df3e9526"
      ]
    },
    "qwen_forced_aligner": {
 -    "integrity": "sha256:f709dbd66cd660f453cb401b571010c46082de31787d09d3b11390da0fbf9e94",
-+    "integrity": "sha256:1e9787ad6d2fa062b23a820e9bc7dbd7d87cf125e47c651537ddb0f41c3bf134",
++    "integrity": "sha256:3a7e1833af3420b91556b28c944f2bcb3b71f7600f32a5f5dfa86ff7ab0aa225",
      "previous": [
 -      "sha256:f85681739271c6dd9e2472de34da44e3ee2fcc8a4d3e6cd8d34ad3fa3087cda6",
 -      "sha256:68aace19d98c7d2b1be4b33889fc71a285ba8e2831a165ef12ec4ad415d8b259",
 -      "sha256:29da7e0ffca747bb90ca6529765a88f8d5480b45fa3cf2d0b704ecee6c4e2013",
 -      "sha256:254f6f6e4316bb875c7545eaf3ebc734ad55f6179cee3308b26f0893bf39d1e5",
 -      "sha256:d796e6ed1cd229e0ab6cbe459875ec64ca66590ee1126aee92ddfbb553dcaca9"
++      "sha256:1e9787ad6d2fa062b23a820e9bc7dbd7d87cf125e47c651537ddb0f41c3bf134",
 +      "sha256:922d210897cf2df75d7e26d0e02ae6ffbd997e986e0cd50c7cd7f0d6a799375b"
      ]
    },
    "youdub.localize": {
 diff --git a/packages/builtin/test/builtin-integrity.test.ts b/packages/builtin/test/builtin-integrity.test.ts
-index c89d141..165939e 100644
+index c89d141..776c79f 100644
 --- a/packages/builtin/test/builtin-integrity.test.ts
 +++ b/packages/builtin/test/builtin-integrity.test.ts
 @@ -1,5 +1,6 @@
@@ -1502,7 +1648,7 @@ index c89d141..165939e 100644
 +  }
 +  for (const [id, previous] of Object.entries(pinned)) {
 +    assert.notEqual(current[id].integrity, previous, id)
-+    assert.deepEqual(current[id].compatibleIntegrities, [previous], id)
++    assert.ok(current[id].compatibleIntegrities.includes(previous), id)
 +    assert.deepEqual(reviewedIntegrities(id, 'sha256:' + 'ab'.repeat(32)), [])
 +  }
 +  assert.equal(current['youdub.graph'].integrity, 'sha256:abe8c08284a2089850e123937fb58d25747c5bc8405281720e79e323b998a349')

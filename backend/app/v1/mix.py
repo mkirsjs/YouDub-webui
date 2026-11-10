@@ -21,6 +21,7 @@ import soundfile as sf
 
 from ..config import ffmpeg_binary
 from . import media
+from .audio import SPEECH_PEAK_FLOOR
 from .audio_segments import AlignedSegment, Alignment, SpeechClip, read_speech_clips
 from .errors import ApiError
 from .segments import read_transcript
@@ -116,6 +117,8 @@ def run(context: StageContext, progress: Callable[[float | None, str], None]) ->
         start_ms = start_sample * 1000 / SAMPLE_RATE
         local = min(1.25, max(0.75, (segment.end_ms - start_ms) / (raw_duration * base)))
         samples = _decode(context, path, adjusted / f"{index + 1:04d}.wav", duration_ratio=base * local)
+        if float(np.max(np.abs(samples))) < SPEECH_PEAK_FLOOR:
+            raise _invalid(f"Adjusted speech clip {index + 1} is silent.")
         end_sample = start_sample + len(samples)
         planned.append([start_sample, len(samples)])
         previous_end = end_sample
