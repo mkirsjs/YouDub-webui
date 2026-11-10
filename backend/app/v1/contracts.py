@@ -36,6 +36,7 @@ VoiceSelection = Annotated[PresetVoice | SourceCloneVoice, Field(discriminator="
 
 class TtsSelection(ModelSelection):
     voice: VoiceSelection
+    group_cues: bool = False
 
 
 class TaskConfig(Contract):

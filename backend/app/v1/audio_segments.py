@@ -18,12 +18,22 @@ class SpeechClip(Contract):
     duration_ms: PositiveInt
     sample_rate_hz: PositiveInt
     channels: Annotated[int, Field(ge=1, le=2)]
+    member_ids: list[NonEmptyString] | None = None
 
 
 class SpeechClips(Contract):
     clips: Annotated[list[SpeechClip], Field(min_length=1)]
 
     def match(self, transcript: Transcript) -> dict[str, SpeechClip]:
+        if any(item.member_ids for item in self.clips):
+            covered: list[str] = []
+            for item in self.clips:
+                if not item.member_ids or item.member_ids[0] != item.segment_id:
+                    raise ValueError("A phrase clip must name its first cue")
+                covered.extend(item.member_ids)
+            if covered != [item.id for item in transcript.segments]:
+                raise ValueError("Phrase clips must cover every original cue in order")
+            return {item.segment_id: item for item in self.clips}
         ids = [item.segment_id for item in self.clips]
         if len(set(ids)) != len(ids) or set(ids) != {item.id for item in transcript.segments}:
             raise ValueError("Each original segment must have exactly one speech clip")

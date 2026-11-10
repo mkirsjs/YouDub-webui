@@ -16,16 +16,24 @@ Translation loads only while a translate node is running. The last translate nod
 
 ## Install
 
+`YOUDUB_PYTHON` on this host is already a virtualenv. `python -m venv --system-site-packages` only sees the base CPython install, so Torch in that virtualenv is not inherited and import fails. Do not install Torch again and do not run pip inside the VoxCPM environment.
+
 ```sh
 DIR=/var/lib/youdub/models/Index-Translate-2B
 PY=/var/lib/youdub/index-translate
-"$YOUDUB_PYTHON" -m venv --system-site-packages "$PY"
+# Discover the environment that already imports Torch. Do not assume a fixed path.
+ORIG_PY=${YOUDUB_PYTHON:-/workspace/youdub-deploy/youdub-home/youdub/runtime/venv/bin/python}
+ORIG_SITE=$("$ORIG_PY" -c "import torch, pathlib; print(pathlib.Path(torch.__file__).resolve().parents[1])")
+"$ORIG_PY" -m venv "$PY"
+NEW_SITE=$("$PY/bin/python" -c "import site; print(next(path for path in site.getsitepackages()))")
+printf '%s\n' "$ORIG_SITE" > "$NEW_SITE/youdub-torch.pth"
 "$PY/bin/pip" install -r backend/requirements/index-translate.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 "$PY/bin/pip" install modelscope -i https://pypi.tuna.tsinghua.edu.cn/simple
+"$PY/bin/python" -c "import os, torch, transformers, pathlib; torch_site=pathlib.Path(torch.__file__).resolve().parents[1]; transformers_file=pathlib.Path(transformers.__file__).resolve(); assert torch_site == pathlib.Path(os.environ['ORIG_SITE']); assert os.environ['PY'] in str(transformers_file); print(torch.__version__, torch.cuda.is_available(), torch_site, transformers_file)"
 "$PY/bin/modelscope" download --model IndexTeam/Index-Translate-2B --local_dir "$DIR"
 ```
 
-`YOUDUB_PYTHON` is the interpreter that already runs VoxCPM. The ModelScope id is `IndexTeam/Index-Translate-2B`.
+The check must show Torch 2.8+cu126 from the original virtualenv and Transformers from `$PY`. If pip offers to upgrade Torch, stop. The requirements file does not select the Transformers Torch extra.
 
 Add these to the existing `youdub-host` supervisor environment and restart only that program after the host bundle is rebuilt:
 

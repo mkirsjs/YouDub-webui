@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .audio_segments import SpeechClip, SpeechClips
+from .cue_groups import group_segments, write_span_reference
 from .audio import audio_info
 from .errors import ApiError
 from .segments import LANGUAGES, Transcript, read_transcript, read_translation
@@ -112,11 +113,24 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
         raise _reference_error("Prepared source references must match transcript utterance IDs exactly.")
     output_dir = context.work_dir / "tts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    clips = [{"segment_id": segment.id, "text": texts[segment.id],
-              "reference_path": str(Path(prepared[segment.id]["path"]).resolve()),
-              "reference_text": prepared[segment.id]["text"],
-              "output_path": str((output_dir / f"{index:06d}.wav").resolve())}
-             for index, segment in enumerate(transcript.segments, start=1)]
+    phrases = group_segments(transcript.segments, texts, enabled=bool(getattr(selection, "group_cues", False)))
+    group_dir = output_dir / "phrase-references"
+    clips = []
+    for index, phrase in enumerate(phrases, start=1):
+        members = [segment for segment in transcript.segments if segment.id in phrase.member_ids]
+        reference_path = Path(prepared[phrase.segment_id]["path"]).resolve()
+        if len(phrase.member_ids) > 1:
+            group_dir.mkdir(parents=True, exist_ok=True)
+            reference_path = (group_dir / f"{index:06d}.wav").resolve()
+            write_span_reference(members, prepared, reference_path)
+        clips.append({
+            "segment_id": phrase.segment_id,
+            "text": phrase.translation_text,
+            "reference_path": str(reference_path),
+            "reference_text": phrase.reference_text,
+            "output_path": str((output_dir / f"{index:06d}.wav").resolve()),
+            **({"member_ids": list(phrase.member_ids)} if getattr(selection, "group_cues", False) else {}),
+        })
     request_path = output_dir / "request.json"
     request_path.write_text(json.dumps({"clips": clips}, ensure_ascii=False, indent=2), encoding="utf-8")
     progress_path = output_dir / "progress.json"
@@ -161,8 +175,11 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
         duration_ms = round(info.frames * 1000 / info.samplerate)
         if duration_ms <= 0:
             raise ApiError(502, "INVALID_PROVIDER_RESULT", "A generated speech clip has no measurable duration.", stage="tts")
-        measured.append(SpeechClip(segment_id=clip["segment_id"], path=path.relative_to(context.work_dir.resolve()).as_posix(),
-                                   duration_ms=duration_ms, sample_rate_hz=info.samplerate, channels=info.channels))
+        measured.append(SpeechClip(
+            segment_id=clip["segment_id"], path=path.relative_to(context.work_dir.resolve()).as_posix(),
+            duration_ms=duration_ms, sample_rate_hz=info.samplerate, channels=info.channels,
+            **({"member_ids": clip["member_ids"]} if clip.get("member_ids") else {}),
+        ))
     payload = SpeechClips(clips=measured)
     payload.match(transcript)
     output = context.work_dir / "speech_clips.json"

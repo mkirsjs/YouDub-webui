@@ -121,6 +121,8 @@ def _content_matches(receipt: dict, clip: dict, model_path: Path, wav: Path, ord
         return False
     if receipt.get("text") != clip["text"] or receipt.get("reference_text") != clip["reference_text"]:
         return False
+    if clip.get("member_ids") and receipt.get("member_ids") != clip["member_ids"]:
+        return False
     if receipt.get("model_path") != str(model_path):
         return False
     try:
@@ -153,6 +155,7 @@ def _write_receipt(
         "device": device,
         "legacy": legacy,
         "request_sha256": request_sha256,
+        **({"member_ids": clip["member_ids"]} if clip.get("member_ids") else {}),
     }
     path = _receipt_path(wav)
     temporary = path.with_suffix(".json.partial")

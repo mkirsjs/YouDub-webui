@@ -27,7 +27,7 @@ it('uses the product RPC envelope and sends uploads through its dedicated authen
   expect(sent.credentials).toBe(true)
   expect(fetch).toHaveBeenCalledTimes(1)
   await expect(requestHarness('https://external.invalid')).rejects.toThrow('Unsupported YouDub API path')
-  expect(fetch).toHaveBeenCalledTimes(2)
+  expect(fetch).toHaveBeenCalledTimes(1)
 })
 it('preserves streamed authorization errors and propagates request cancellation', async () => {
   vi.stubGlobal('fetch', vi.fn(async (_path: string, init: RequestInit) => {

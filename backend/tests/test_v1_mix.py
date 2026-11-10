@@ -226,6 +226,25 @@ def test_missing_background_is_not_replaced_by_original_audio(context):
     assert "background" in str(error.value)
 
 
+def test_a_phrase_clip_keeps_both_cue_ids_and_one_adjusted_file(context):
+    require_ffmpeg()
+    write_tone(context.work_dir / "tts/phrase.wav", 1200, 440)
+    info = sf.info(context.work_dir / "tts/phrase.wav")
+    context.input_files["speech_clips"].write_text(json.dumps({"clips": [{
+        "segment_id": "first", "path": "tts/phrase.wav", "duration_ms": round(info.frames * 1000 / info.samplerate),
+        "sample_rate_hz": info.samplerate, "channels": info.channels, "member_ids": ["first", "last"],
+    }]}))
+    result = mix.run(context, lambda value, message: None)
+    alignment = json.loads(result.output_files["alignment"].read_text())
+    assert [item["segment_id"] for item in alignment["segments"]] == ["first", "last"]
+    assert alignment["segments"][0]["source_start_ms"] == 500
+    assert alignment["segments"][1]["source_end_ms"] == 1700
+    assert (context.work_dir / "adjusted/0001.wav").is_file()
+    assert not (context.work_dir / "adjusted/0002.wav").exists()
+    placement = json.loads((context.work_dir / "placement.json").read_text())
+    assert placement[0]["member_ids"] == ["first", "last"]
+
+
 def test_cancelling_mix_reaps_ffmpeg_before_returning(context, cancelled_media_process):
     with pytest.raises(WorkerError, match="The host cancelled this invocation") as error:
         mix.run(replace(context, check_cancel=cancelled_media_process), lambda value, message: None)

@@ -26,7 +26,7 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
   recognize: { ...make('transcribe', '语音识别', 'Transcribe', '文字起こし', 'text', [audio('audio', '音频'), media()], { ...source, initialPrompt: { type: ['string', 'null'] } }, { sourceLanguage: 'auto', initialPrompt: null }), corrections: { outputPorts: ['transcript'], schemaIds: ['transcript/v1'] }, ui: { quickFields: ['sourceLanguage'], detailId: 'youdub.transcript' } },
   translate: { ...make('translate', '翻译', 'Translate', '翻訳', 'text', [transcript()], { ...source, ...target }, { sourceLanguage: 'auto', targetLanguage: 'zh' }), corrections: { outputPorts: ['translation'], schemaIds: ['translation/v1'] }, ui: { quickFields: ['targetLanguage'], detailId: 'youdub.translation' } },
   reference: make('reference', '准备参考音频', 'Voice reference', '参照音声', 'audio', [transcript(), audio('audio', '人声')]),
-  synthesize: make('synthesize', '生成配音', 'Synthesize speech', '吹き替え生成', 'audio', [transcript(), translation(), port('references', '参考音频', 'voice-references/v1', 'json', false)], { ...target, voice: { oneOf: [object({ mode: { const: 'source_clone' } }, ['mode']), object({ mode: { const: 'preset' }, id: { type: 'string', minLength: 1 } }, ['mode', 'id'])] } }, { targetLanguage: 'zh', voice: { mode: 'source_clone' } }),
+  synthesize: make('synthesize', '生成配音', 'Synthesize speech', '吹き替え生成', 'audio', [transcript(), translation(), port('references', '参考音频', 'voice-references/v1', 'json', false)], { ...target, groupCues: { type: 'boolean' }, voice: { oneOf: [object({ mode: { const: 'source_clone' } }, ['mode']), object({ mode: { const: 'preset' }, id: { type: 'string', minLength: 1 } }, ['mode', 'id'])] } }, { targetLanguage: 'zh', groupCues: false, voice: { mode: 'source_clone' } }),
   mix: make('mix', '混音', 'Mix audio', 'ミックス', 'audio', [transcript(), port('speechAudio', '分段配音', 'speech-audio/v1'), media(), audio('background', '背景音', false)], { keepBackground: { type: 'boolean' } }, { keepBackground: false }),
   align: make('align', '字幕对齐', 'Align subtitles', '字幕の整列', 'text', [transcript(), translation(), port('dubbedTimeline', '配音时间轴', 'dubbed-timeline/v1'), port('adjustedSpeech', '调整后配音', 'speech-audio/v1')], target, { targetLanguage: 'zh' }),
   export: make('export', '导出视频', 'Export video', '動画を書き出し', 'output', [video(), media(), transcript(), translation(), audio('finalAudio', '合成音频', false), port('dubbedTimeline', '配音时间轴', 'dubbed-timeline/v1', 'json', false), port('wordAlignment', '词级时间轴', 'word-alignment/v1', 'json', false)], { ...source, ...target, renderSubtitles: { type: 'boolean' } }, { sourceLanguage: 'auto', targetLanguage: 'zh', renderSubtitles: true }),
@@ -34,7 +34,7 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
 }
 
 
-nodeDescriptors.synthesize.ui = { quickFields: ['targetLanguage'], editorId: 'youdub.synthesize' }
+nodeDescriptors.synthesize.ui = { quickFields: ['targetLanguage', 'groupCues'], editorId: 'youdub.synthesize' }
 nodeDescriptors.export.ui = { quickFields: ['targetLanguage'] }
 for (const [operation, title] of Object.entries({ synthesize: ['Dubbing language', '配音语言', '吹き替えの言語'], align: ['Alignment language', '对齐语言', '整列の言語'], export: ['Export language', '导出语言', '書き出しの言語'] })) {
   const properties = nodeDescriptors[operation].configSchema.properties
@@ -56,7 +56,7 @@ const fieldTitles: Record<string, [string, string, string]> = {
   sourceLanguage: ['原文语言', 'Source language', '元の言語'], targetLanguage: ['目标语言', 'Target language', '翻訳先の言語'],
   initialPrompt: ['识别提示词', 'Recognition prompt', '認識プロンプト'],
   proxyPort: ['本机 HTTP 代理端口（0 为直连）', 'Local HTTP proxy port (0 for direct)', 'ローカル HTTP プロキシポート（0 は直接接続）'],
-  voice: ['声音', 'Voice', '音声'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
+  voice: ['声音', 'Voice', '音声'], groupCues: ['按语段合并短字幕后再配音', 'Group short cues into phrases before dubbing', '短い字幕を文単位にまとめてから吹き替える'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
   renderSubtitles: ['烧录字幕', 'Burn subtitles', '字幕を焼き込む'], url: ['视频链接', 'Video URL', '動画リンク'],
 }
 for (const descriptor of Object.values(nodeDescriptors)) for (const schema of [descriptor.configSchema, descriptor.runtimeInputSchema]) {
