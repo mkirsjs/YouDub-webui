@@ -1,0 +1,76 @@
+diff --git a/artifacts/schema-description-deploy.md b/artifacts/schema-description-deploy.md
+new file mode 100644
+index 0000000..2b1f6ee
+--- /dev/null
++++ b/artifacts/schema-description-deploy.md
+@@ -0,0 +1,13 @@
++# Schema description strings
++
++Apply on `66085fa55dcb8fb99e44c8357ad89487bc1e02ba`. This only changes the two synthesize field descriptions that Ajv rejected. Phrase grouping, speaker scope, Index, upload progress, and auth stay as deployed.
++
++`groupCues.description` and `speakerScope.description` are strings. Ajv draft 2020 rejects an object there, which made `POST /api/v2/workflow-documents/validate` and upload return 500 before a task existed.
++
++```sh
++git apply --check artifacts/youdub-schema-description-since-66085fa.patch
++git apply artifacts/youdub-schema-description-since-66085fa.patch
++npm --prefix apps/harness run build
++```
++
++Restart `youdub-host` only when no task is running. Then validate the built-in「视频配音」graph. Do not create a task, do not run a short video, and do not change the database. Anonymous product API stays 401. A successful validate response is 200 with `valid: true`.
+diff --git a/packages/builtin/src/node-contracts.ts b/packages/builtin/src/node-contracts.ts
+index 66ec960..3600185 100644
+--- a/packages/builtin/src/node-contracts.ts
++++ b/packages/builtin/src/node-contracts.ts
+@@ -41,21 +41,9 @@ nodeDescriptors.synthesize.configSchema.properties.speakerScope = {
+     { value: 'single', label: { default: 'I confirm one speaker: short cues may join', translations: { zh: '我确认整段只有一个人：短句可以合并', ja: '一人だけと確認：短い文は結合できる' } } },
+     { value: 'multi', label: { default: 'Several people: unlabeled cues stay separate, no speaker detection', translations: { zh: '可能多人：没有说话人识别，未标记的句子各自配音', ja: '複数人の可能性：話者検出はなく、未標記の文は別々' } } },
+   ],
+-  description: {
+-    default: 'Whisper tiny does not label speakers, and this control does not turn speaker detection on. Unknown and multi never join unlabeled cues, so a fast exchange is not cloned as one voice. Choose single only when the whole source is one person. Matching speaker ids can still join. Different ids never join. No speaker model is downloaded.',
+-    translations: {
+-      zh: 'Whisper tiny 不标说话人，这个选项也不会打开说话人识别。默认「未知」不把相邻句合成同一参考，避免采访里快速换人被克隆成同一个人。只有确认整段只有一个人时才选「单人」。选择「可能多人」时，没有标记的句子各自配音。已经标成同一人的短句可以合并，不同的人不会合并。不会下载说话人模型。',
+-      ja: 'Whisper tiny は話者を付けません。この設定は話者検出を有効にしません。既定の「不明」では隣接する文を一つの参照にまとめず、会話の入れ替わりを一人の声にしません。「一人」はソース全体が一人だと確認したときだけです。「複数人」では未標記の文を別々に残します。同じ話者IDだけ結合し、違う話者は結合しません。話者モデルは追加しません。',
+-    },
+-  },
+-}
+-nodeDescriptors.synthesize.configSchema.properties.groupCues.description = {
+-  default: 'Short cues can share one cloned phrase. With no speaker labels this stays off until Speaker scope is single. It does not detect who is speaking.',
+-  translations: {
+-    zh: '短字幕可以合成一段再配音。没有说话人标记时，说话人范围仍是「未知」或「可能多人」就不会跨句合并。这不是说话人识别。',
+-    ja: '短い字幕を一つの吹き替えにまとめられます。話者ラベルがないとき、話者範囲が「不明」または「複数人」なら文をまたいで結合しません。話者検出ではありません。',
+-  },
++  description: 'Whisper tiny 不标说话人，这个选项也不会打开说话人识别。默认「未知」不把相邻句合成同一参考。只有确认整段只有一个人时才选「单人」。选择「可能多人」时，没有标记的句子各自配音。已经标成同一人的短句可以合并，不同的人不会合并。',
+ }
++nodeDescriptors.synthesize.configSchema.properties.groupCues.description = '短字幕可以合成一段再配音。没有说话人标记时，说话人范围仍是「未知」或「可能多人」就不会跨句合并。这不是说话人识别。'
+ nodeDescriptors.synthesize.defaults.speakerScope = 'unknown'
+ nodeDescriptors.synthesize.ui = { quickFields: ['speakerScope', 'groupCues', 'targetLanguage'], editorId: 'youdub.synthesize' }
+ nodeDescriptors.export.ui = { quickFields: ['targetLanguage'] }
+diff --git a/packages/builtin/test/workflow-graph.test.ts b/packages/builtin/test/workflow-graph.test.ts
+index f21731d..5aab279 100644
+--- a/packages/builtin/test/workflow-graph.test.ts
++++ b/packages/builtin/test/workflow-graph.test.ts
+@@ -30,6 +30,24 @@ async function setup(t: any, devices: Record<string, string[]> = {}) {
+   return { ctx, compile, templates, subtitles: templates[0].document }
+ }
+ 
++test('synthesize descriptions are schema strings and the dubbing graph validates', async t => {
++  const { default: Ajv } = await import('ajv/dist/2020.js')
++  const { nodeDescriptors } = await import('../src/node-contracts.js')
++  const schema = nodeDescriptors.synthesize.configSchema
++  const ajv = new Ajv({ strict: false, allErrors: true })
++  ajv.compile(schema)
++  assert.equal(typeof schema.properties.groupCues.description, 'string')
++  assert.equal(typeof schema.properties.speakerScope.description, 'string')
++  const { compile, templates } = await setup(t)
++  const dubbing = templates.find(item => item.id === 'youdub.dubbing')!.document
++  const unknown = await compile(dubbing)
++  assert.equal(unknown.plan.bindings.synthesize.options.speakerScope, 'unknown')
++  assert.equal(unknown.plan.bindings.synthesize.options.groupCues, true)
++  const single = structuredClone(dubbing)
++  single.nodes.find(node => node.id === 'synthesize')!.config.speakerScope = 'single'
++  assert.equal((await compile(single)).plan.bindings.synthesize.options.speakerScope, 'single')
++})
++
+ test('independent templates compile without mutating graph and only freeze selected resources', async t => {
+   const { templates, compile } = await setup(t)
+   const plans = await Promise.all(templates.map(async item => {
