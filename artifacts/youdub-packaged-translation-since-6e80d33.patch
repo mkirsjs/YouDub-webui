@@ -1,0 +1,218 @@
+diff --git a/apps/harness/build.mjs b/apps/harness/build.mjs
+index 856b212..7a195b9 100644
+--- a/apps/harness/build.mjs
++++ b/apps/harness/build.mjs
+@@ -2,7 +2,7 @@ import { checkLocales } from './check-locales.mjs';
+ import { build } from 'esbuild';
+ import { fileURLToPath, pathToFileURL } from 'node:url';
+ import { resolve, dirname } from 'node:path';
+-import { readFile, writeFile } from 'node:fs/promises';
++import { cp, readFile, writeFile } from 'node:fs/promises';
+ import { createRequire } from 'node:module';
+ import { readFrameworkSource } from './framework-source.mjs';
+ await checkLocales();
+@@ -57,12 +57,15 @@ const host = await build({ ...common, entryPoints: ['src/host.mjs'], outfile: 'd
+     builder.onResolve({ filter: /^@youdub\/sdk\// }, args => ({ path: resolve(root, 'packages/sdk/src', args.path.slice('@youdub/sdk/'.length) + '.ts') }));
+   } }],
+ });
++await cp(resolve(here, 'src/backend/local-translation.cjs'), resolve(here, 'dist/local-translation.cjs'));
+ const client = await build({ ...common, entryPoints: ['src/client.jsx'], outfile: 'dist/client.js', platform: 'browser', format: 'cjs', jsx: 'automatic', metafile: true,
+   external: ['react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-store'], loader: { '.css': 'text' }, nodePaths: [resolve(here, 'node_modules'), resolve(web, 'node_modules')],
+   define: { 'process.env.DSH_CLIENT_VERSION': JSON.stringify(product.version), 'process.env.DSH_CLIENT_TITLE': JSON.stringify('YouDub'), 'process.env.DSH_CLIENT_COMMIT_HASH': 'undefined', 'process.env.DSH_CLIENT_GIT_DIRTY': 'undefined' },
+   alias: { '@': resolve(web, 'src') },
+   plugins: [sourceBuiltImports, officialAssets, { name: 'youdub-component-boundaries', setup(builder) {
+     builder.onResolve({ filter: /^cordis$/ }, () => ({ path: '@deepseek-ai/cordis', external: true }));
++    builder.onResolve({ filter: /^@youdub\/sdk$/ }, () => ({ path: resolve(root, 'packages/sdk/src/index.ts') }));
++    builder.onResolve({ filter: /^@youdub\/sdk\// }, args => ({ path: resolve(root, 'packages/sdk/src', args.path.slice('@youdub/sdk/'.length) + '.ts') }));
+     // Both tests and Desktop use the same YouDub wrappers. Only resolve their shared
+     // framework dependency to the module already owned by the official client loader.
+     builder.onResolve({ filter: /(?:^|\/)harness-primitives$/ }, args => {
+diff --git a/apps/harness/cordis.patch.yml b/apps/harness/cordis.patch.yml
+index f1befb6..727d4df 100644
+--- a/apps/harness/cordis.patch.yml
++++ b/apps/harness/cordis.patch.yml
+@@ -34,7 +34,7 @@
+     - id: llm-pi-ai
+       name: '@deepseek-ai/dsh-llm-pi-ai'
+       config:
+-        providers: !!js '(() => { const named = ["YOUDUB_TRANSLATION_BASE_URL", "YOUDUB_TRANSLATION_MODEL", "YOUDUB_TRANSLATION_MODEL_DIR", "YOUDUB_TRANSLATION_SERVER_COMMAND"].some(name => (process.env[name] || "").trim()); if (!named) return {}; const root = (process.env.YOUDUB_MEDIA_ROOT || "").trim(); if (!root) throw new Error("YOUDUB_MEDIA_ROOT is required when local translation is configured"); return require("node:module").createRequire(root + "/apps/harness/package.json")("./src/backend/local-translation.cjs").providers(process.env); })()'
++        providers: !!js '(() => { const named = ["YOUDUB_TRANSLATION_BASE_URL", "YOUDUB_TRANSLATION_MODEL", "YOUDUB_TRANSLATION_MODEL_DIR", "YOUDUB_TRANSLATION_SERVER_COMMAND"].some(name => (process.env[name] || "").trim()); if (!named) return {}; const root = (process.env.YOUDUB_MEDIA_ROOT || "").trim(); if (!root) throw new Error("YOUDUB_MEDIA_ROOT is required when local translation is configured"); const fs = process.getBuiltinModule("node:fs"); const candidates = [process.cwd() + "/youdub-plugin/dist/local-translation.cjs", process.cwd() + "/node_modules/@youdub/harness-subtitles/dist/local-translation.cjs"]; candidates.push(root + "/apps/harness/dist/web-runtime/youdub-plugin/dist/local-translation.cjs", root + "/apps/harness/dist/local-translation.cjs"); const file = candidates.find(path => fs.existsSync(path)); if (!file) throw new Error("Packaged local-translation.cjs is missing from the official runtime. Looked in: " + candidates.join(", ")); const { createRequire } = process.getBuiltinModule("node:module"); return createRequire(file)(file).providers(process.env); })()'
+     - id: subprocess
+       name: '@deepseek-ai/dsh-subprocess-local'
+     - id: plugin-inventory
+diff --git a/apps/harness/package.json b/apps/harness/package.json
+index 3cc16fb..3070aea 100644
+--- a/apps/harness/package.json
++++ b/apps/harness/package.json
+@@ -9,6 +9,7 @@
+   "exports": {
+     ".": "./dist/host.mjs",
+     "./client": "./dist/client.js",
++    "./local-translation.cjs": "./dist/local-translation.cjs",
+     "./package.json": "./package.json"
+   },
+   "dsh": {
+diff --git a/apps/harness/prepare-source-development.mjs b/apps/harness/prepare-source-development.mjs
+index 24cbcdf..f21fbf6 100644
+--- a/apps/harness/prepare-source-development.mjs
++++ b/apps/harness/prepare-source-development.mjs
+@@ -67,6 +67,8 @@ export async function prepareSourceDevelopment({ projectDirectory = join(here, '
+   await mkdir(join(pluginRoot, 'dist'), { recursive: true });
+   for (const name of ['package.json', 'cordis.patch.yml']) await cp(join(here, name), join(pluginRoot, name));
+   for (const name of ['host.mjs', 'client.js']) await cp(join(here, 'dist', name), join(pluginRoot, 'dist', name));
++  // host.mjs loads this sibling with createRequire(import.meta.url). esbuild does not bundle it.
++  await cp(join(here, 'src/backend/local-translation.cjs'), join(pluginRoot, 'dist/local-translation.cjs'));
+   // External source-linked plugins import the YouDub SDK as a peer. Publish
+   // that SDK from the application, alongside the framework services.
+   const productManifest = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'));
+diff --git a/apps/harness/test/packaged-translation.test.mjs b/apps/harness/test/packaged-translation.test.mjs
+new file mode 100644
+index 0000000..f8dbef7
+--- /dev/null
++++ b/apps/harness/test/packaged-translation.test.mjs
+@@ -0,0 +1,118 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { fork } from 'node:child_process'
++import { once } from 'node:events'
++import { mkdtemp, readFile, rm } from 'node:fs/promises'
++import { createRequire } from 'node:module'
++import { tmpdir } from 'node:os'
++import { join, resolve } from 'node:path'
++import { pathToFileURL } from 'node:url'
++import { prepareSourceDevelopment } from '../prepare-source-development.mjs'
++import { prepareYouDubProfile } from '../prepare-profile.mjs'
++import { desktopNodeEnvironment } from '../../../vendor/deepseek-harness/source/apps/desktop/src/node-environment.ts'
++
++const app = resolve(import.meta.dirname, '..')
++const root = resolve(app, '../..')
++const translationEnv = {
++  YOUDUB_MEDIA_ROOT: root,
++  YOUDUB_TRANSLATION_MODEL_DIR: '/var/lib/youdub/models/Index-Translate-2B',
++  YOUDUB_TRANSLATION_PYTHON: 'python3',
++  YOUDUB_LOCAL_TRANSLATION_KEY: 'local',
++}
++
++test('official prepare packages local translation and the ESM loader activates the pi provider', { timeout: 180_000 }, async (t) => {
++  const directory = await mkdtemp(join(tmpdir(), 'youdub-packaged-translation-'))
++  let child
++  let exited
++  t.after(async () => {
++    try {
++      if (child?.connected) child.send({ type: 'shutdown' })
++      if (exited) {
++        const timeout = setTimeout(() => child.kill('SIGKILL'), 10_000)
++        try { await exited } finally { clearTimeout(timeout) }
++      }
++    } finally { await rm(directory, { recursive: true, force: true }) }
++  })
++
++  const { project, pluginRoot, node, pnpm, nodeBin } = await prepareSourceDevelopment({ projectDirectory: join(directory, 'runtime') })
++  const packaged = join(pluginRoot, 'dist/local-translation.cjs')
++  const hostBundle = await readFile(join(pluginRoot, 'dist/host.mjs'), 'utf8')
++  assert.match(hostBundle, /local-translation\.cjs/)
++  const loaded = createRequire(join(pluginRoot, 'dist/host.mjs'))('./local-translation.cjs')
++  assert.equal(typeof loaded.providers, 'function')
++  assert.equal(loaded, createRequire(packaged)(packaged))
++  const hostModule = await import(pathToFileURL(join(pluginRoot, 'dist/host.mjs')).href)
++  assert.equal(hostModule.name, 'youdub-subtitles')
++
++  const hostRequire = createRequire(join(project, 'node_modules/@deepseek-ai/dsh-desktop-host/package.json'))
++  const loaderPath = hostRequire.resolve('@deepseek-ai/cordis-plugin-loader')
++  assert.match(loaderPath, /vendor\/loader\/lib\/index\.js$/)
++  const { interpolate } = await import(pathToFileURL(loaderPath).href)
++  const includePath = hostRequire.resolve('@deepseek-ai/cordis-plugin-include')
++  const { entryListSchema } = await import(pathToFileURL(includePath).href)
++  const yaml = createRequire(includePath)('js-yaml')
++  const patch = yaml.load(await readFile(join(pluginRoot, 'cordis.patch.yml'), 'utf8'), { schema: entryListSchema })
++  const expression = patch[0].insert.find(entry => entry.id === 'llm-pi-ai').config.providers
++  assert.equal(typeof expression.__jsExpr, 'string')
++  assert.doesNotMatch(expression.__jsExpr, /\brequire\s*\(/)
++  const bare = Object.create(null)
++  assert.throws(() => interpolate(bare, { __jsExpr: 'require("node:module")' }), /require is not defined/)
++  const previous = { ...process.env }
++  Object.assign(process.env, translationEnv)
++  let providers
++  const cwd = process.cwd()
++  try {
++    process.chdir(project)
++    providers = interpolate(bare, expression)
++  } finally {
++    process.chdir(cwd)
++    for (const key of Object.keys(translationEnv)) {
++      if (previous[key] === undefined) delete process.env[key]
++      else process.env[key] = previous[key]
++    }
++  }
++  assert.equal(providers.local.baseURL, 'http://127.0.0.1:8091/v1')
++  assert.equal(providers.local.api, 'openai-completions')
++  assert.equal(providers.local.models[0].id, 'IndexTeam/Index-Translate-2B')
++
++  const cordis = await import(pathToFileURL(hostRequire.resolve('@deepseek-ai/cordis')).href)
++  const llm = await import(pathToFileURL(hostRequire.resolve('@deepseek-ai/dsh-llm')).href)
++  const pi = await import(pathToFileURL(hostRequire.resolve('@deepseek-ai/dsh-llm-pi-ai')).href)
++  const ctx = new cordis.Context()
++  t.after(() => ctx.fiber.dispose())
++  await ctx.plugin(llm.default)
++  await ctx.plugin(pi, { providers })
++  await ctx.fiber.await()
++  assert.ok(ctx.llm.listProviders().some(item => item.id === 'local'))
++
++  const home = join(directory, 'home')
++  const profile = join(home, 'profiles/youdub')
++  await prepareYouDubProfile(profile, pluginRoot, project, { command: node, args: ['--expose-internals', pnpm], env: desktopNodeEnvironment(node, nodeBin, process.env) })
++  child = fork(join(project, 'node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js'),
++    [project, profile, pnpm, nodeBin], {
++      cwd: project, execPath: node, execArgv: ['--expose-internals'], silent: true,
++      env: { ...desktopNodeEnvironment(node, undefined, process.env), ...translationEnv, DSH_HOME: home, YOUDUB_NODE_PATH: node, YOUDUB_TEST_SKIP_SETUP: '1', YOUDUB_TEST_PYTHON: process.env.YOUDUB_TEST_PYTHON || '/usr/bin/python3' },
++    })
++  let output = ''
++  child.stderr.on('data', data => { output = (output + data).slice(-24_000) })
++  child.stdout.on('data', data => { output = (output + data).slice(-24_000) })
++  exited = once(child, 'exit')
++  const ready = await new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(`Host did not become ready: ${output}`)), 90_000)
++    child.on('message', message => {
++      if (message.type === 'fatal') { clearTimeout(timer); reject(new Error(message.diagnostic || message.message || output)) }
++      if (message.type === 'ready') { clearTimeout(timer); resolve(message) }
++    })
++  })
++  assert.doesNotMatch(output, /require is not defined/)
++  assert.doesNotMatch(output, /MODULE_NOT_FOUND/)
++  assert.doesNotMatch(output, /did not activate/)
++  const origin = new URL(ready.url).origin
++  const anonymous = await fetch(`${origin}/api/youdub/v2`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method: 'GET', path: '/api/setup' }) })
++  assert.equal(anonymous.status, 401)
++  const exchange = await fetch(ready.url, { redirect: 'manual' })
++  assert.equal(exchange.status, 303)
++  const cookie = exchange.headers.getSetCookie().map(value => value.split(';')[0]).join('; ')
++  const tasks = await fetch(`${origin}/api/youdub/v2`, { method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ method: 'GET', path: '/api/v2/tasks' }) })
++  assert.equal(tasks.status, 200, await tasks.text())
++})
+diff --git a/artifacts/packaged-translation-deploy.md b/artifacts/packaged-translation-deploy.md
+new file mode 100644
+index 0000000..f82538a
+--- /dev/null
++++ b/artifacts/packaged-translation-deploy.md
+@@ -0,0 +1,21 @@
++# Package the local translation module
++
++Apply on `6e80d33fa77b3b964478bd95ef3bf0c92e0907af`. Do not reorder earlier patches. Do not download weights again and do not change the translation model.
++
++Two production entries failed after that build:
++
++- `llm-pi-ai` evaluated `!!js` with a bare `require`. The ESM loader (`vendor/loader/lib/index.js` eval / interpolate) throws `require is not defined`.
++- `youdub-subtitles` loads `createRequire(import.meta.url)('./local-translation.cjs')` from `dist/host.mjs`. `prepare-source-development` copied only `host.mjs` and `client.js`, so the runtime plugin did not contain `local-translation.cjs`.
++
++The loader expression now uses `process.getBuiltinModule('node:module').createRequire` and reads the file prepare places at `youdub-plugin/dist/local-translation.cjs`. The official build also copies that file next to `apps/harness/dist/host.mjs`. No manual copy.
++
++```sh
++git apply --check artifacts/youdub-packaged-translation-since-6e80d33.patch
++git apply artifacts/youdub-packaged-translation-since-6e80d33.patch
++npm --prefix apps/harness run build
++npm --prefix apps/harness start
++```
++
++Restart only `youdub-host`, and only when no task is running. Keep the existing origin, launch token, and the four translation variables. Do not touch 8888 or 8889.
++
++Startup is acceptable when the log has no `require is not defined`, no `MODULE_NOT_FOUND` for `local-translation.cjs`, and no `did not activate`. An anonymous product API call is 401, the token exchange is 303, and an authenticated `GET /api/v2/tasks` is 200. The seven succeeded tasks stay in place.

@@ -67,6 +67,8 @@ export async function prepareSourceDevelopment({ projectDirectory = join(here, '
   await mkdir(join(pluginRoot, 'dist'), { recursive: true });
   for (const name of ['package.json', 'cordis.patch.yml']) await cp(join(here, name), join(pluginRoot, name));
   for (const name of ['host.mjs', 'client.js']) await cp(join(here, 'dist', name), join(pluginRoot, 'dist', name));
+  // host.mjs loads this sibling with createRequire(import.meta.url). esbuild does not bundle it.
+  await cp(join(here, 'src/backend/local-translation.cjs'), join(pluginRoot, 'dist/local-translation.cjs'));
   // External source-linked plugins import the YouDub SDK as a peer. Publish
   // that SDK from the application, alongside the framework services.
   const productManifest = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'));
