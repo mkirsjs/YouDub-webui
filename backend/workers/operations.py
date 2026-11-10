@@ -74,6 +74,8 @@ class Operation:
             if name == "tts":
                 values["voice"] = SimpleNamespace(**self.option("voice", default=values.get("voice") or {"mode": "source_clone"}))
                 values["group_cues"] = bool(self.option("groupCues", "group_cues", False))
+                values["speaker_scope"] = self.option("speakerScope", "speaker_scope", "unknown")
+                values["single_speaker"] = bool(self.option("singleSpeaker", "single_speaker", False))
             return SimpleNamespace(**values)
         # Build only this operation's parameters. Historical task aliases remain
         # accepted by option(); unrelated model selections never enter the stage.

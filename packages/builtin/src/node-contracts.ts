@@ -34,7 +34,30 @@ export const nodeDescriptors: Record<string, NodeDescriptor> = {
 }
 
 
-nodeDescriptors.synthesize.ui = { quickFields: ['targetLanguage', 'groupCues'], editorId: 'youdub.synthesize' }
+nodeDescriptors.synthesize.configSchema.properties.speakerScope = {
+  type: 'string', enum: ['unknown', 'single', 'multi'],
+  'x-options': [
+    { value: 'unknown', label: { default: 'Unknown speakers: do not join cues', translations: { zh: '未知说话人：不跨句合并', ja: '話者不明：文をまたいで結合しない' } } },
+    { value: 'single', label: { default: 'I confirm one speaker: short cues may join', translations: { zh: '我确认整段只有一个人：短句可以合并', ja: '一人だけと確認：短い文は結合できる' } } },
+    { value: 'multi', label: { default: 'Several people: unlabeled cues stay separate, no speaker detection', translations: { zh: '可能多人：没有说话人识别，未标记的句子各自配音', ja: '複数人の可能性：話者検出はなく、未標記の文は別々' } } },
+  ],
+  description: {
+    default: 'Whisper tiny does not label speakers, and this control does not turn speaker detection on. Unknown and multi never join unlabeled cues, so a fast exchange is not cloned as one voice. Choose single only when the whole source is one person. Matching speaker ids can still join. Different ids never join. No speaker model is downloaded.',
+    translations: {
+      zh: 'Whisper tiny 不标说话人，这个选项也不会打开说话人识别。默认「未知」不把相邻句合成同一参考，避免采访里快速换人被克隆成同一个人。只有确认整段只有一个人时才选「单人」。选择「可能多人」时，没有标记的句子各自配音。已经标成同一人的短句可以合并，不同的人不会合并。不会下载说话人模型。',
+      ja: 'Whisper tiny は話者を付けません。この設定は話者検出を有効にしません。既定の「不明」では隣接する文を一つの参照にまとめず、会話の入れ替わりを一人の声にしません。「一人」はソース全体が一人だと確認したときだけです。「複数人」では未標記の文を別々に残します。同じ話者IDだけ結合し、違う話者は結合しません。話者モデルは追加しません。',
+    },
+  },
+}
+nodeDescriptors.synthesize.configSchema.properties.groupCues.description = {
+  default: 'Short cues can share one cloned phrase. With no speaker labels this stays off until Speaker scope is single. It does not detect who is speaking.',
+  translations: {
+    zh: '短字幕可以合成一段再配音。没有说话人标记时，说话人范围仍是「未知」或「可能多人」就不会跨句合并。这不是说话人识别。',
+    ja: '短い字幕を一つの吹き替えにまとめられます。話者ラベルがないとき、話者範囲が「不明」または「複数人」なら文をまたいで結合しません。話者検出ではありません。',
+  },
+}
+nodeDescriptors.synthesize.defaults.speakerScope = 'unknown'
+nodeDescriptors.synthesize.ui = { quickFields: ['speakerScope', 'groupCues', 'targetLanguage'], editorId: 'youdub.synthesize' }
 nodeDescriptors.export.ui = { quickFields: ['targetLanguage'] }
 for (const [operation, title] of Object.entries({ synthesize: ['Dubbing language', '配音语言', '吹き替えの言語'], align: ['Alignment language', '对齐语言', '整列の言語'], export: ['Export language', '导出语言', '書き出しの言語'] })) {
   const properties = nodeDescriptors[operation].configSchema.properties
@@ -56,7 +79,7 @@ const fieldTitles: Record<string, [string, string, string]> = {
   sourceLanguage: ['原文语言', 'Source language', '元の言語'], targetLanguage: ['目标语言', 'Target language', '翻訳先の言語'],
   initialPrompt: ['识别提示词', 'Recognition prompt', '認識プロンプト'],
   proxyPort: ['本机 HTTP 代理端口（0 为直连）', 'Local HTTP proxy port (0 for direct)', 'ローカル HTTP プロキシポート（0 は直接接続）'],
-  voice: ['声音', 'Voice', '音声'], groupCues: ['按语段合并短字幕后再配音', 'Group short cues into phrases before dubbing', '短い字幕を文単位にまとめてから吹き替える'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
+  voice: ['声音', 'Voice', '音声'], speakerScope: ['说话人范围', 'Speaker scope', '話者の範囲'], groupCues: ['短句合并', 'Group short cues', '短い文をまとめる'], keepBackground: ['保留背景音', 'Keep background audio', '背景音を保持'],
   renderSubtitles: ['烧录字幕', 'Burn subtitles', '字幕を焼き込む'], url: ['视频链接', 'Video URL', '動画リンク'],
 }
 for (const descriptor of Object.values(nodeDescriptors)) for (const schema of [descriptor.configSchema, descriptor.runtimeInputSchema]) {

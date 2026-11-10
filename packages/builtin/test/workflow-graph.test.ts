@@ -46,6 +46,9 @@ test('independent templates compile without mutating graph and only freeze selec
   assert.ok(plans[0].steps.every(step => !['synthesize', 'separate', 'reference', 'mix'].includes(step.id)))
   assert.deepEqual(templates.map(item => item.id), ['youdub.subtitles', 'youdub.dubbing', 'youdub.subtitles-dubbing'])
   assert.equal(plans[1].bindings.export.options.outputMode, 'dubbing')
+  assert.equal(plans[1].bindings.synthesize.options.groupCues, true)
+  assert.equal(plans[1].bindings.synthesize.options.speakerScope, 'unknown')
+  assert.equal(plans[1].bindings.synthesize.options.groupCues === true && plans[1].bindings.synthesize.options.speakerScope !== 'single', true)
   assert.equal(plans[2].bindings.export.options.outputMode, 'both')
   const reviewed = structuredClone(templates[0].document)
   reviewed.nodes.find(node => node.id === 'recognize')!.autoContinue = false

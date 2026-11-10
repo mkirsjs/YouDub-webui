@@ -22,7 +22,7 @@ python -m backend.app.v1.seam_compare \
 
 The author has no dubbing grouping step. Subtitle punctuation splitting is display-only. Whisper tiny does not set `speaker_id`.
 
-`groupCues` defaults off, so an old saved graph stays one cue per clone. The built-in「视频配音」template sets it on for a new task. Two cues join only when the gap is at most 300 ms, the span stays within 12 seconds, and the previous cue does not end a sentence. Different known speakers never join. If either cue has a speaker id and the other does not, they do not join. If neither has a speaker id, the join uses only the pause, punctuation, and length rules. That is not a claim that the speakers are the same.
+`groupCues` defaults off, so an old saved graph stays one cue per clone. The built-in「视频配音」template turns grouping on and sets `speakerScope` to `unknown`. Unlabeled cues do not join. See `artifacts/speaker-scope-deploy.md`. Two cues join only when the gap is at most 300 ms, the span stays within 12 seconds, and the previous cue does not end a sentence. Different known speakers never join. The same known speaker may join. Unlabeled cues join only when the user sets `speakerScope` to `single`.
 
 The English prompt is the joined source text. The Chinese line is the joined translation. The reference wav is the span from the first cue start through the last cue end, including a short internal pause. It is not a fixed trim of every cue. A receipt without the same `member_ids` is not reused.
 

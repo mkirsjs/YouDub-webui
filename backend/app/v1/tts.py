@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .audio_segments import SpeechClip, SpeechClips
-from .cue_groups import group_segments, write_span_reference
+from .cue_groups import group_segments, resolve_speaker_scope, unknown_blocks, write_span_reference
 from .audio import audio_info
 from .errors import ApiError
 from .segments import LANGUAGES, Transcript, read_transcript, read_translation
@@ -113,7 +113,17 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
         raise _reference_error("Prepared source references must match transcript utterance IDs exactly.")
     output_dir = context.work_dir / "tts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    phrases = group_segments(transcript.segments, texts, enabled=bool(getattr(selection, "group_cues", False)))
+    grouping = bool(getattr(selection, "group_cues", False))
+    speaker_scope = resolve_speaker_scope(selection)
+    phrases = group_segments(transcript.segments, texts, enabled=grouping, speaker_scope=speaker_scope)
+    (output_dir / "grouping.json").write_text(json.dumps({
+        "group_cues": grouping,
+        "speaker_scope": speaker_scope,
+        "diarization": False,
+        "phrases": [list(phrase.member_ids) for phrase in phrases],
+        "unknown_not_joined": unknown_blocks(transcript.segments, speaker_scope=speaker_scope) if grouping else [],
+        "note": "No speaker model is loaded. Unlabeled cues stay separate unless speaker scope is single.",
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     group_dir = output_dir / "phrase-references"
     clips = []
     for index, phrase in enumerate(phrases, start=1):
@@ -129,7 +139,7 @@ def run(context: StageContext, progress: Callable[[float | None, str], None], *,
             "reference_path": str(reference_path),
             "reference_text": phrase.reference_text,
             "output_path": str((output_dir / f"{index:06d}.wav").resolve()),
-            **({"member_ids": list(phrase.member_ids)} if getattr(selection, "group_cues", False) else {}),
+            **({"member_ids": list(phrase.member_ids), "speaker_scope": speaker_scope} if grouping else {}),
         })
     request_path = output_dir / "request.json"
     request_path.write_text(json.dumps({"clips": clips}, ensure_ascii=False, indent=2), encoding="utf-8")
